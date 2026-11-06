@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HLS 下载 · 拾流</title>
+  <link rel="icon" href="icons/icon32.png">
+  <link rel="stylesheet" href="hls.css">
+  <script type="module" src="hls.js"></script>
+</head>
+<body>
+  <main>
+    <header><img src="icons/icon48.png" alt="" width="32" height="32"><strong>拾流</strong></header>
+    <section aria-labelledby="heading">
+      <h1 id="heading">HLS 下载</h1>
+      <div class="source"><h2 id="title" dir="auto">正在读取媒体</h2><p id="site" dir="auto"></p></div>
+      <div id="tracks" hidden>
+        <label for="track">画质与音轨</label>
+        <select id="track" aria-describedby="track-hint"></select>
+        <p class="hint" id="track-hint" hidden>选择主轨道可保存画面，选择独立音轨可单独保存声音。</p>
+      </div>
+      <p id="summary" class="summary" hidden></p>
+      <progress id="bar" aria-label="分片下载进度" hidden></progress>
+      <p id="status" role="status" aria-live="polite">正在读取播放列表…</p>
+      <div class="actions">
+        <button id="start" disabled>选择位置并下载</button>
+        <button id="cancel" class="secondary" hidden>取消</button>
+        <button id="retry" class="secondary" hidden>重新读取</button>
+      </div>
+      <p class="save-hint">下载期间请保持此页打开。完成后可在所选文件夹中打开文件。</p>
+    </section>
+    <p class="foot">支持未加密的 HLS 点播，单个输出文件上限为 <strong>4 GiB</strong>。</p>
+  </main>
+</body>
+</html>

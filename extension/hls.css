@@ -1,0 +1,35 @@
+:root {
+  color-scheme: light;
+  font: 15px/1.6 system-ui, "Microsoft YaHei UI", sans-serif;
+  color: #182d28;
+  background: #f2f6f2;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; }
+main { width: min(100% - 40px, 570px); margin: clamp(32px, 10vh, 110px) auto; }
+header { display: flex; align-items: center; gap: 9px; margin: 0 0 20px 2px; font-size: 20px; }
+section { padding: clamp(22px, 5vw, 36px); border: 1px solid #dbe5df; border-radius: 17px; background: #fbfcfa; }
+h1 { margin: 0 0 24px; font-size: clamp(26px, 6vw, 34px); line-height: 1.2; letter-spacing: -.04em; }
+h2 { margin: 0; font-size: 17px; line-height: 1.5; overflow-wrap: anywhere; }
+.source { padding: 14px 17px; border-left: 3px solid #0d7061; background: #eff6f1; border-radius: 0 6px 6px 0; }
+#site { margin: 3px 0 0; font-size: 12px; overflow-wrap: anywhere; color: #526a60; }
+#tracks { margin-top: 22px; }
+label { display: block; margin-bottom: 8px; font-weight: 650; }
+select { width: 100%; min-height: 42px; padding: 6px 10px; border-radius: 6px; border: 1px solid #91ada1; color: #182d28; background: #fff; font: inherit; }
+.hint, .foot, .save-hint { color: #526a60; font-size: 13px; }
+.hint { margin: 7px 0 0; }
+.save-hint { margin: 11px 0 0; }
+.foot { margin: 14px 4px; line-height: 1.7; }
+.foot strong { color: #345747; }
+.summary { color: #345747; margin: 20px 0 0; font-variant-numeric: tabular-nums; }
+progress { margin-top: 15px; width: 100%; height: 8px; accent-color: #0d7061; }
+#status { color: #526a60; margin: 14px 0; }
+#status.error { color: #9c382c; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+button { padding: 9px 19px; border: 1px solid #096a5b; border-radius: 7px; background: #096a5b; color: #fff; font-family: inherit; font-size: 14px; line-height: 1.5; font-weight: 650; cursor: pointer; }
+button:hover:enabled { background: #075d50; }
+button:disabled { background: #d5e2d9; border-color: #d5e2d9; color: #57695d; cursor: default; }
+button.secondary { color: #345747; border-color: #bdcfc4; background: transparent; }
+button.secondary:hover:enabled { background: #e4eee7; }
+:focus-visible { outline: 3px solid #ce862f; outline-offset: 3px; }

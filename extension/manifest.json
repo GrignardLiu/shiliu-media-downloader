@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "拾流 · 网页影音下载器",
+  "short_name": "拾流",
+  "description": "发现当前网页中的视频和音频，下载媒体文件或保存未加密的 HLS 点播内容。",
+  "version": "1.1.1",
+  "minimum_chrome_version": "106",
+  "permissions": ["webRequest", "webNavigation", "storage", "downloads", "scripting"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "拾流 · 查看当前网页的影音",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
