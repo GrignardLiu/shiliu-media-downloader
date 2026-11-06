@@ -27,10 +27,10 @@ class Element {
   closest() { return this; }
 }
 
-async function popup() {
+async function popup({items, hasBlob = false} = {}) {
   const elements = Object.fromEntries([...source('popup.html').matchAll(/ id="([^"]+)"/g)]
     .map(([, id]) => [id, new Element()]));
-  const items = ['audio', 'hls'].map(kind => ({
+  items ??= ['audio', 'hls'].map(kind => ({
     id: kind, kind, url: 'https://cdn.example.test/' + kind + '?token=secret', name: kind,
   }));
   elements['row-template'].content = {firstElementChild: new Element()};
@@ -44,13 +44,15 @@ async function popup() {
     response: {ok: true, downloadId: 12},
     opened: [],
     ids: [],
+    rows() { return elements.list.children.map(row => row.dataset.item); },
+    blobNote: elements['blob-note'],
     action(i) { return elements.list.children[i].querySelector('.action'); },
     note(i) { return elements.list.children[i].querySelector('.transfer-status'); },
     filter(i) { elements.filters.handlers.click({target: elements.filters.children[i]}); },
   };
   const chrome = {
     runtime: {getURL: n => 'chrome-extension://test/' + n, sendMessage: async msg =>
-      msg.type === 'LIST_MEDIA' ? {ok: true, items} : api.response},
+      msg.type === 'LIST_MEDIA' ? {ok: true, items, hasBlob} : api.response},
     tabs: {query: async () => [{id: 7, url: 'https://example.test/watch'}], create: async tab => api.opened.push(tab.url)},
     downloads: {
       search: async ({id}) => { api.ids.push(id); return [api.item]; },
@@ -103,6 +105,45 @@ test('direct and HLS file pages show where to continue without registering nativ
   assert.deepEqual(ui.opened, ['chrome-extension://test/hls.html#tab=7&item=hls']);
   assert.match(ui.note(1).textContent, /HLS/);
   assert.deepEqual(ui.ids, []);
+});
+
+test('only HLS entries named master are promoted; filtering and download actions retain the selected resource', async () => {
+  const items = [
+    {id: 'preview', name: 'preview.mp4', kind: 'video'},
+    {id: 'child', name: 'index.m3u8', kind: 'hls'},
+    {id: 'song', name: 'mix.mp3', kind: 'audio'},
+    {id: 'main', name: 'MASTER.M3U8', kind: 'hls'},
+    {id: 'lookalike', name: 'master-edit.m3u8', kind: 'hls'},
+    {id: 'other', name: 'master.m3u8', kind: 'video'},
+  ].map(item => ({...item, url: 'https://cdn.example.test/master/' + item.name + '?alias=master.m3u8'}));
+  const ui = await popup({items, hasBlob: true});
+  assert.deepEqual(ui.rows(), ['main', 'preview', 'child', 'song', 'lookalike', 'other']);
+  assert.equal(ui.blobNote.hidden, true);
+  ui.filter(2);
+  assert.deepEqual(ui.rows(), ['main', 'child', 'lookalike']);
+  assert.equal(ui.action(0).querySelector('span').textContent, 'HLS 下载');
+  assert.equal(ui.action(1).querySelector('span').textContent, 'HLS 下载');
+  await ui.action(1).handlers.click();
+  assert.deepEqual(ui.opened, ['chrome-extension://test/hls.html#tab=7&item=child']);
+  ui.filter(1);
+  assert.deepEqual(ui.rows(), ['song']);
+});
+
+test('a generic server failure suggests the stream filter only when an HLS resource exists', async () => {
+  const withHls = await popup();
+  withHls.item = {state: 'interrupted', error: 'SERVER_FAILED'};
+  await withHls.action(0).handlers.click();
+  assert.match(withHls.note(0).textContent, /SERVER_FAILED.*流媒体.*HLS 下载/);
+  assert.doesNotMatch(withHls.note(0).textContent, /403|过期|拒绝/);
+  const directOnly = await popup({
+    hasBlob: true,
+    items: [{id: 'a', kind: 'audio', name: 'a.mp3', url: 'https://media.example.test/a.mp3'}],
+  });
+  assert.equal(directOnly.blobNote.hidden, false);
+  directOnly.response = {ok: false, error: 'SERVER_FAILED'};
+  await directOnly.action(0).handlers.click();
+  assert.match(directOnly.note(0).textContent, /SERVER_FAILED/);
+  assert.doesNotMatch(directOnly.note(0).textContent, /HLS|403|过期|拒绝/);
 });
 
 test('current failed response suppresses stale player sources and links, and a later successful response restores them', () => {

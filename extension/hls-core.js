@@ -96,7 +96,11 @@ export function parsePlaylist(source, base) {
     if (++lineCount > 400_000) throw new Error("清单的行数过多。");
   }
   const lines = source.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-  if (lines[0] !== "#EXTM3U") throw new Error("服务器没有返回 HLS 清单，链接可能已过期。");
+  if (lines[0] !== "#EXTM3U") {
+    const error = new Error("服务器没有返回 HLS 清单，链接可能已过期。");
+    error.canTryAnotherPlaylist = true;
+    throw error;
+  }
   for (const line of lines) {
     if (line.startsWith("#EXT-X-SESSION-KEY:") || line === "#EXT-X-KEY") {
       throw new Error("此清单包含加密轨道，无法导出。");
@@ -163,6 +167,7 @@ export async function readResource(part, signal, maxBytes = MAX_SEGMENT_BYTES, c
     response.body?.cancel().catch(() => {});
     const error = new Error(message);
     error.retryable = retryable;
+    error.canTryAnotherPlaylist = !response.ok;
     throw error;
   };
   if (!response.ok || !response.body) {

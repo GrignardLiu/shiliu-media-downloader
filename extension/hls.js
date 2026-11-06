@@ -7,6 +7,7 @@ let playlist;
 let format;
 let firstPart;
 let controller;
+let preparing;
 
 function status(message, error = false) {
   el.status.textContent = message;
@@ -32,6 +33,7 @@ function setBusy(busy) {
 
 async function preparePlaylist(value) {
   const signal = controller.signal;
+  preparing = value.init ? "初始化片段" : "首个媒体分片";
   status("正在检查分片格式…");
   // Determine the extension before the next click so the file picker can open
   // under that click's user activation, with the correct suggested filename.
@@ -58,6 +60,7 @@ function selectedAudio() {
 
 async function loadSelection() {
   const selected = options[el.track.selectedIndex];
+  preparing = "所选画质或音轨的清单";
   const parsed = await loadPlaylist(selected.url, controller.signal, resource.credentialOrigin);
   if (parsed.options) throw new Error("暂不支持嵌套的多级主清单。");
   await preparePlaylist(parsed);
@@ -70,11 +73,13 @@ async function readSelection(refreshRoot) {
   controller = new AbortController();
   el.summary.hidden = true;
   el.retry.hidden = true;
+  el.alternatives.hidden = true;
   el.bar.hidden = true;
   setBusy(true);
   status("正在读取播放列表…");
   try {
     if (refreshRoot) {
+      preparing = "播放清单";
       options = [];
       el.tracks.hidden = true;
       const parsed = await loadPlaylist(resource.url, controller.signal, resource.credentialOrigin);
@@ -90,7 +95,10 @@ async function readSelection(refreshRoot) {
     await loadSelection();
   } catch (error) {
     const canceled = controller.signal.aborted;
-    status(canceled ? "已取消读取。" : errorText(error), !canceled);
+    status(canceled ? "已取消读取。" : preparing + "读取失败。" + errorText(error), !canceled);
+    if (!canceled && (error.canTryAnotherPlaylist || error instanceof TypeError)) {
+      el.alternatives.hidden = !el["alternative-list"].childElementCount;
+    }
     el.retry.hidden = false;
   } finally {
     controller = null;
@@ -202,6 +210,18 @@ async function initialize() {
     const result = await chrome.runtime.sendMessage({type: "GET_MEDIA", tabId: Number(tab), id});
     if (!result?.ok || result.item?.kind !== "hls") throw new Error(result?.error || "该资源已失效。请在原网页重新扫描并打开。");
     resource = {url: httpUrl(result.item.url), name: result.item.name || "媒体"};
+    for (const other of result.alternatives || []) {
+      const link = document.createElement("a");
+      const next = new URL(location.href);
+      next.hash = new URLSearchParams({tab, item: other.id}).toString();
+      link.href = next.href;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = other.name;
+      const row = document.createElement("li");
+      row.append(link);
+      el["alternative-list"].append(row);
+    }
     const origin = new URL(resource.url).origin;
     if (result.credentialOrigin === origin) resource.credentialOrigin = origin;
     el.title.textContent = resource.name;

@@ -16,8 +16,15 @@ const mimeExtensions = {
 const containerAliases = {mp4: ['m4v'], m4a: ['mp4'], weba: ['webm'], ogg: ['oga','opus'],
   ogv: ['ogg'], mpeg: ['mpg'], aiff: ['aif']};
 const mediaMime = /^(?:audio|video)\/|mpegurl|dash\+xml|^application\/ogg$/;
+// An fMP4 initializer or segment may have the same MIME and extension as a
+// whole movie. Match rendition tokens such as "v1-a1", not arbitrary titles.
+const trackFragmentName = /^(?:init|seg(?:ment)?|chunk|frag(?:ment)?)(?:[-_.]\d+)*[-_.][va]\d+(?:[-_.][va]?\d+)*\.(?:mp4|m4a|aac)$/i;
 const pending = new Map();
 const requests = new Map();
+const probes = new Map();
+const probeAccept = 'application/vnd.apple.mpegurl, application/x-mpegurl;q=0.9, */*;q=0.5';
+const probeScope = (tabId, documentId, url) => JSON.stringify([tabId, documentId, url]);
+const probeStorageKey = async scope => 'playlist-probe:' + await routeKey(scope);
 const mediaRequests = {urls: ['http://*/*', 'https://*/*'],
   types: ['main_frame', 'sub_frame', 'media', 'xmlhttprequest', 'object', 'other']};
 const keyFor = tabId => 'media:' + tabId;
@@ -35,12 +42,22 @@ function inOrder(tabId, operation) {
 
 async function readState(tabId) {
   const key = keyFor(tabId);
-  return (await chrome.storage.session.get(key))[key] || newState();
+  const state = (await chrome.storage.session.get(key))[key];
+  if (!state) return newState();
+  if (!state.trackFragmentsChecked) {
+    state.items = state.items.filter(item => {
+      if (item.kind !== 'video' && item.kind !== 'audio') return true;
+      return !trackFragmentName.test(item.name) &&
+        !trackFragmentName.test(decode(new URL(item.url).pathname.split('/').pop()));
+    });
+    await saveState(tabId, state);
+  }
+  return state;
 }
 
 async function saveState(tabId, state) {
   const key = keyFor(tabId);
-  const value = {[key]: {...state, updatedAt: Date.now()}};
+  const value = {[key]: {...state, trackFragmentsChecked: true, updatedAt: Date.now()}};
   try {
     await chrome.storage.session.set(value);
   } catch (error) {
@@ -119,6 +136,7 @@ function describe(rawUrl, rawMime = '', suggested = '', hint = '', from = '') {
 
   // Browser fetches for MSE fragments are usually unusable on their own.
   if (/\.(m4s|m4f|cmfv|cmfa|ismv|isma)$/i.test(basename) || mime.includes('iso.segment')) return null;
+  if (from !== 'main_frame' && (trackFragmentName.test(basename) || trackFragmentName.test(suggested))) return null;
   if (from !== 'element' && from !== 'link' && from !== 'media' && from !== 'main_frame') {
     if (ext === 'ts' || mime === 'video/mp2t' ||
         /^(?:init|seg(?:ment)?|chunk|fragment)[\d._-]*\.(?:mp4|aac|m4a)$/i.test(basename)) return null;
@@ -158,6 +176,7 @@ function upsert(state, item, frameId, documentId, source, size = null, rank = 2)
         update.name = safeName(item.name, update.extension, update.kind);
       }
     }
+    if (item.playlistSeenAt) update.playlistSeenAt = Math.max(item.playlistSeenAt, existing.playlistSeenAt || 0);
     if (Object.keys(update).every(key => existing[key] === update[key])) return false;
     Object.assign(existing, update);
     return true;
@@ -204,17 +223,34 @@ chrome.webRequest.onSendHeaders.addListener(details => {
   requests.delete(requestId); // Redirects can keep the ID and send different headers.
   const source = httpOrigin(initiator);
   if (tabId < 0 || method !== 'GET' || !source) return;
-  let referrer = '', requestOrigin = '', hadCookies = false;
+  let referrer = '', requestOrigin = '', hadCookies = false, probeFormat = false;
   for (const header of requestHeaders || []) {
     const key = header.name.toLowerCase();
     if (key === 'referer' && httpOrigin(header.value) === source) referrer = source + '/';
     if (key === 'origin' && header.value === source) requestOrigin = source;
     if (key === 'cookie') hadCookies = true;
+    if (key === 'accept' && header.value === probeAccept) probeFormat = true;
   }
   // Never copy cookie values, authorization headers or the browsing URL. Keep
   // only a bounded, in-memory record until we know this response is playable.
   if (requests.size >= 2048) requests.delete(requests.keys().next().value);
-  requests.set(requestId, {target: httpOrigin(details.url), referrer, requestOrigin, hadCookies});
+  const observed = {target: httpOrigin(details.url), referrer, requestOrigin, hadCookies};
+  if (probeFormat && details.documentId && details.type === 'xmlhttprequest') {
+    const scope = probeScope(tabId, details.documentId, details.url);
+    const probe = probes.get(scope);
+    if (probe) {
+      probe.count++;
+      observed.probe = probe;
+      observed.trusted = probe.frameId === details.frameId && probe.source === source && !hadCookies &&
+        !(requestHeaders || []).some(header => header.name.toLowerCase() === 'authorization');
+    } else {
+      // On worker restart, an outstanding probe must not become a normal captured response.
+      // An ordinary player using the same Accept is unaffected outside this exact document/URL window.
+      observed.quarantined = probeStorageKey(scope).then(async key =>
+        (await chrome.storage.session.get(key))[key] >= details.timeStamp).catch(() => true);
+    }
+  }
+  requests.set(requestId, observed);
 }, mediaRequests, ['requestHeaders', 'extraHeaders']);
 
 chrome.webRequest.onErrorOccurred.addListener(({requestId}) => requests.delete(requestId), mediaRequests);
@@ -223,6 +259,12 @@ chrome.webRequest.onHeadersReceived.addListener(details => {
   const {tabId, frameId, documentId, method, statusCode, type} = details;
   const observed = requests.get(details.requestId);
   requests.delete(details.requestId);
+  if (observed?.probe) {
+    const ok = observed.trusted && observed.probe.scope === probeScope(tabId, documentId, details.url) &&
+      method === 'GET' && type === 'xmlhttprequest' && statusCode === 200;
+    observed.probe.resolve(ok ? {referrer: observed.referrer, requestOrigin: observed.requestOrigin} : null);
+    return;
+  }
   if (tabId < 0 || method !== 'GET' || statusCode < 200 || statusCode >= 300 ||
       details.initiator === 'chrome-extension://' + chrome.runtime.id) return;
   const headers = {};
@@ -235,12 +277,14 @@ chrome.webRequest.onHeadersReceived.addListener(details => {
   const item = describe(details.url, headers['content-type'],
     dispositionName(headers['content-disposition'] || ''), '', type);
   if (!item) return;
+  if (item.kind === 'hls') item.playlistSeenAt = details.timeStamp || Date.now();
   if (observed && observed.target === httpOrigin(item.url)) {
     item.referrer = observed.referrer;
     item.requestOrigin = observed.requestOrigin;
     item.hadCookies = observed.hadCookies;
   }
   inOrder(tabId, async () => {
+    if (observed?.quarantined && await observed.quarantined) return;
     // A response can arrive after the page or iframe that initiated it is gone.
     if (documentId && !['main_frame','sub_frame'].includes(type)) {
       const frame = await chrome.webNavigation.getFrame({tabId, frameId}).catch(() => null);
@@ -344,6 +388,7 @@ async function listMedia(tabId) {
         if (candidate.from === 'timing' && candidate.time < state.since) continue;
         const item = describe(candidate.url, candidate.mime, '', candidate.kind, candidate.from);
         if (!item) continue;
+        if (item.kind === 'hls' && candidate.from === 'timing') item.playlistSeenAt = candidate.time;
         urls.add(item.url);
         const rank = {element: 3, timing: 1, link: 0}[candidate.from];
         found.push({item, frameId: scan.frameId, documentId: scan.documentId || '', rank});
@@ -361,7 +406,7 @@ async function listMedia(tabId) {
       if (!unique.has(item.url) || item.source === 'network') unique.set(item.url, item);
     }
     return {ok: true, hasBlob, scanBlocked: !scans.some(scan => scan.result),
-      items: [...unique.values()].map(({frameId, documentId, named, rank, referrer, requestOrigin,
+      items: [...unique.values()].map(({frameId, documentId, named, rank, referrer, requestOrigin, playlistSeenAt,
         hadCookies, ...item}) => item)};
   });
 }
@@ -374,7 +419,29 @@ async function getMedia(tabId, id) {
   if (!frame || (item.documentId && frame.documentId && frame.documentId !== item.documentId)) {
     throw new Error('页面已更新，请刷新资源列表。');
   }
-  return item;
+  return {item, items: state.items, frame};
+}
+
+function playlistAlternatives(master, items) {
+  const root = new URL(master.url);
+  if (master.kind !== 'hls' || !master.documentId ||
+      !/^master\.m3u8?$/i.test(decode(root.pathname.split('/').pop()))) return [];
+  const directory = new URL('.', root).href;
+  const variants = new Map();
+  for (const row of items) {
+    if (row.kind !== 'hls' || row.frameId !== master.frameId || row.documentId !== master.documentId ||
+        (!row.playlistSeenAt && row.source !== 'network' && row.rank !== 1)) continue;
+    const url = new URL(row.url);
+    if (new URL('.', url).href !== directory || url.pathname === root.pathname) continue;
+    // A failed master provides no track list. Only offer observed siblings with
+    // conventional variant names; an unrelated or ad playlist can share this directory.
+    const name = decode(url.pathname.split('/').pop());
+    if (!/^(?:(?:index|variant|track|stream|playlist|chunklist|level)(?:[-_.](?:[av]?\d+(?:p|k)?|audio|video|low|medium|high|sd|hd|uhd))*|\d+p)\.m3u8?$/i.test(name)) continue;
+    const previous = variants.get(url.pathname);
+    if (!previous || (row.playlistSeenAt || 0) >= (previous.playlistSeenAt || 0)) variants.set(url.pathname, row);
+  }
+  return [...variants.values()].sort((a, b) => (b.playlistSeenAt || 0) - (a.playlistSeenAt || 0))
+    .slice(0, 6).map(({id, name}) => ({id, name}));
 }
 
 // Session rules survive worker suspension. One ID per download tab makes
@@ -401,9 +468,81 @@ async function isCurrentDownloadPage(sender) {
   return tab && (!tab.url || tab.url === sender.url) && (!tab.pendingUrl || tab.pendingUrl === sender.url);
 }
 
+// Runs in the isolated world of precisely the document that recorded this URL.
+async function verifyTimedPlaylist(url, time, source, accept, deadline) {
+  if (location.origin !== source || Date.now() >= deadline) return false;
+  const seen = performance.getEntriesByName(url, 'resource').some(entry =>
+    ['fetch', 'xmlhttprequest', 'audio', 'video'].includes(entry.initiatorType) &&
+    !(entry.responseStatus >= 400) && Math.abs(performance.timeOrigin + entry.startTime - time) < 1);
+  if (!seen) return false;
+  let response, reader;
+  try {
+    response = await fetch(url, {method: 'GET', mode: 'cors', credentials: 'omit', redirect: 'error',
+      cache: 'no-store', headers: {Accept: accept}, referrer: location.origin + '/',
+      signal: AbortSignal.timeout(Math.max(1, deadline - Date.now()))});
+    if (response.status !== 200 || response.url !== url || !response.body) return false;
+    // BYOB bounds the amount read even for a URL serving a large non-playlist body.
+    reader = response.body.getReader({mode: 'byob'});
+    const prefix = new Uint8Array(16);
+    let used = 0;
+    while (used < prefix.length) {
+      const {value, done} = await reader.read(new Uint8Array(prefix.length - used));
+      if (done || !value.length) break;
+      prefix.set(value, used);
+      used += value.length;
+      if (value.includes(10)) break;
+    }
+    return /^#EXTM3U\r?\n/.test(new TextDecoder().decode(prefix.subarray(0, used)));
+  } catch {
+    return false;
+  } finally {
+    if (reader) await reader.cancel().catch(() => {});
+    else if (response?.body) await response.body.cancel().catch(() => {});
+  }
+}
+
+function recoverPlaylist(tabId, item, frame) {
+  const scope = probeScope(tabId, item.documentId, item.url);
+  const existing = probes.get(scope);
+  if (existing) return existing.result;
+  const probe = {scope, source: httpOrigin(frame.url), frameId: item.frameId, count: 0};
+  const headers = new Promise(resolve => { probe.resolve = resolve; });
+  probes.set(scope, probe);
+  probe.result = (async () => {
+    const deadline = Date.now() + 3500;
+    let key, timer, injection, injectionFinished = false;
+    const cleanup = async () => {
+      if (key) await chrome.storage.session.remove(key).catch(() => {});
+      probes.delete(scope);
+    };
+    try {
+      key = await probeStorageKey(scope);
+      await chrome.storage.session.set({[key]: deadline + 1000});
+      injection = chrome.scripting.executeScript({target: {tabId, documentIds: [item.documentId]},
+        world: 'ISOLATED', func: verifyTimedPlaylist,
+        args: [item.url, item.playlistSeenAt, probe.source, probeAccept, deadline]})
+        .finally(() => { injectionFinished = true; });
+      const checked = injection.then(([scan]) =>
+        scan?.result === true && scan.documentId === item.documentId && scan.frameId === item.frameId ? headers : null);
+      const timeout = new Promise(resolve => { timer = setTimeout(() => resolve(null), 4000); });
+      const context = await Promise.race([checked, timeout]);
+      return probe.count === 1 ? context : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+      // If the source tab is frozen, stop waiting for it, but quarantine its late network events
+      // until the isolated task exits or the document is destroyed.
+      if (injection && !injectionFinished) injection.then(cleanup, cleanup);
+      else await cleanup();
+    }
+  })();
+  return probe.result;
+}
+
 async function prepareMedia(tabId, id, sender) {
-  const item = await getMedia(tabId, id);
-  const {referrer, requestOrigin, hadCookies, ...result} = item;
+  const {item, items, frame} = await getMedia(tabId, id);
+  const {referrer, requestOrigin, hadCookies, playlistSeenAt, ...result} = item;
   const page = item.kind === 'hls' ? 'hls.html' : 'file.html';
   const url = new URL(sender.url);
   const downloadTab = sender.tab?.id;
@@ -414,13 +553,23 @@ async function prepareMedia(tabId, id, sender) {
   const target = new URLSearchParams(url.hash.slice(1));
   if (target.get('tab') !== String(tabId) || target.get('item') !== id) throw new Error('下载页对应的资源已变更，请重新打开。');
   const origin = httpOrigin(item.url);
+  let context = {referrer, requestOrigin};
+  if (item.kind === 'hls' && item.source === 'page' && item.documentId && frame.documentId === item.documentId &&
+      item.playlistSeenAt > 0 && httpOrigin(frame.url) && !referrer && !requestOrigin && !hadCookies) {
+    if (!await isCurrentDownloadPage(sender)) throw new Error('下载页已关闭或更新，请重新打开。');
+    const recovered = await recoverPlaylist(tabId, item, frame);
+    // A new same-document route may have invalidated the resource during the probe.
+    const current = await getMedia(tabId, id);
+    if (current.frame.documentId !== item.documentId) throw new Error('原网页已更新，请重新扫描资源。');
+    if (recovered) context = recovered;
+  }
   await inOrder(downloadTab, async () => {
     // A queued message from a page that already navigated away must not
     // install a fresh rule after its navigation cleanup.
     if (!await isCurrentDownloadPage(sender)) {
       throw new Error('下载页已关闭或更新，请重新打开。');
     }
-    if (!referrer && !requestOrigin) {
+    if (!context.referrer && !context.requestOrigin) {
       await clearDownloadRule(downloadTab);
       return;
     }
@@ -428,8 +577,8 @@ async function prepareMedia(tabId, id, sender) {
     // hosts instead of broadening a rule for a nonstandard URL.
     if (!origin || /[*|^]/.test(origin)) throw new Error('此媒体地址无法安全重用网页来源。');
     const requestHeaders = [];
-    if (referrer) requestHeaders.push({header: 'Referer', operation: 'set', value: referrer});
-    if (requestOrigin) requestHeaders.push({header: 'Origin', operation: 'set', value: requestOrigin});
+    if (context.referrer) requestHeaders.push({header: 'Referer', operation: 'set', value: context.referrer});
+    if (context.requestOrigin) requestHeaders.push({header: 'Origin', operation: 'set', value: context.requestOrigin});
     const ruleId = downloadTab + 1;
     const rule = {id: ruleId, priority: 1, action: {type: 'modifyHeaders', requestHeaders},
       condition: {tabIds: [downloadTab], initiatorDomains: [chrome.runtime.id], requestMethods: ['get'],
@@ -438,11 +587,13 @@ async function prepareMedia(tabId, id, sender) {
     await chrome.storage.session.set({[key]: true});
     await chrome.declarativeNetRequest.updateSessionRules({removeRuleIds: [ruleId], addRules: [rule]});
   });
-  return {ok: true, item: result, ...(hadCookies ? {credentialOrigin: origin} : {})};
+  const alternatives = playlistAlternatives(item, items);
+  return {ok: true, item: result, ...(hadCookies ? {credentialOrigin: origin} : {}),
+    ...(alternatives.length ? {alternatives} : {})};
 }
 
 async function downloadMedia(tabId, id) {
-  const item = await getMedia(tabId, id);
+  const {item} = await getMedia(tabId, id);
   if (item.kind === 'hls') throw new Error('请打开 HLS 下载页面。');
   if (item.referrer || item.requestOrigin) {
     const params = new URLSearchParams({tab: String(tabId), item: id});

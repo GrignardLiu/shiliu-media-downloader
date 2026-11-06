@@ -31,6 +31,10 @@ function displayName(item) {
     || typeNames[groupOf(item)] + "资源";
 }
 
+function hasMasterName(item) {
+  return item.kind === "hls" && /^master\.m3u8?$/i.test(displayName(item));
+}
+
 function formatOf(item) {
   if (item.kind === "hls") return "HLS";
   if (item.kind === "dash") return "DASH";
@@ -78,6 +82,12 @@ function setFeedback(id, message, tone = "", busy = false) {
 
 function interruption(reason) {
   if (reason === "USER_CANCELED") return "已取消下载。";
+  if (reason === "SERVER_FAILED") {
+    const next = items.some(item => item.kind === "hls")
+      ? "页面中也有 HLS 资源，可在「流媒体」中点「HLS 下载」。"
+      : "请稍后重试，或在原网页重新播放后扫描。";
+    return "服务器未能完成此次下载（SERVER_FAILED）。" + next;
+  }
   if (["SERVER_FORBIDDEN", "SERVER_UNAUTHORIZED"].includes(reason)) {
     return "网站拒绝了下载请求。请在原网页重新播放，获取新的下载地址。";
   }
@@ -119,6 +129,7 @@ chrome.downloads.onChanged.addListener(change => {
 
 function explainError(error, fallback) {
   const message = typeof error === "string" ? error : error?.message;
+  if (message === "SERVER_FAILED") return interruption(message);
   // Browser-level exceptions can contain request URLs. Display our own localized fallback for those.
   return message && /[\u3400-\u9fff]/.test(message) && !/https?:/i.test(message)
     ? message.slice(0, 220) : fallback;
@@ -149,8 +160,8 @@ function makeRow(item) {
 
   const action = row.querySelector(".action");
   const isHls = item.kind === "hls";
-  const label = isHls ? "打开" : item.kind === "dash" ? "保存清单" : "下载";
-  const fullLabel = isHls ? "打开 HLS 下载页" : item.kind === "dash" ? "保存 DASH 播放清单" : "下载文件";
+  const label = isHls ? "HLS 下载" : item.kind === "dash" ? "保存清单" : "下载";
+  const fullLabel = isHls ? "打开 HLS 下载页，有多档画质时可选择" : item.kind === "dash" ? "保存 DASH 播放清单" : "下载文件";
   action.querySelector("use").setAttribute("href", isHls ? "#i-open" : "#i-download");
   action.querySelector("span").textContent = label;
   action.setAttribute("aria-label", fullLabel + "，" + name);
@@ -166,7 +177,7 @@ function render() {
   for (const button of filters.querySelectorAll("button")) {
     button.setAttribute("aria-pressed", String(button.dataset.filter === filter));
   }
-  byId("blob-note").hidden = !hasBlob || !items.length;
+  byId("blob-note").hidden = !hasBlob || !items.length || items.some(item => item.kind === "hls");
   const visible = items.filter((item) => filter === "all" || groupOf(item) === filter);
   list.replaceChildren(...visible.map(makeRow));
   if (visible.length) {
@@ -236,7 +247,9 @@ async function scan() {
     }
     const result = await chrome.runtime.sendMessage({ type: "LIST_MEDIA", tabId });
     if (!result?.ok) throw new Error(result?.error || "请刷新当前网页，再重新扫描。");
-    items = Array.isArray(result.items) ? result.items : [];
+    // A conventional master filename is a sorting hint. Only the HLS page parses the actual playlist.
+    items = Array.isArray(result.items)
+      ? result.items.slice().sort((a, b) => Number(hasMasterName(b)) - Number(hasMasterName(a))) : [];
     hasBlob = Boolean(result.hasBlob);
     scanBlocked = Boolean(result.scanBlocked);
     filters.hidden = false;

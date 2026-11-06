@@ -119,13 +119,18 @@ test("supports TS map headers and counts post-ID3 payload against the exact 4 Gi
 test("download page rolls back a partial response or cancellation and starts from zero on retry", {timeout: 5000}, async t => {
   let ready;
   const prepared = new Promise(resolve => { ready = resolve; });
-  const ids = "start cancel retry track tracks track-hint bar summary status title site".split(" ");
+  const ids = "start cancel retry track tracks track-hint bar summary status title site alternatives alternative-list".split(" ");
   const ui = Object.fromEntries(ids.map(id => [id, {id, classList: {toggle() {}},
     addEventListener(event, fn) { this[event] = fn; }}]));
   ui.track.replaceChildren = () => { ui.track.selectedIndex = 0; };
+  const links = [];
+  ui["alternative-list"].append = row => {
+    links.push(row.child);
+    ui["alternative-list"].childElementCount = links.length;
+  };
   Object.defineProperty(ui.start, "disabled", {set(value) { if (!value) ready(); }});
 
-  let mode = "partial";
+  let mode = "master-failed";
   let committed = Buffer.from("previous file");
   let aborts = 0;
   const pickedNames = [];
@@ -141,10 +146,10 @@ test("download page rolls back a partial response or cancellation and starts fro
     };
   }};
   const globals = {
-    document: {querySelectorAll: () => Object.values(ui)},
-    location: {hash: "#tab=1&item=abc"},
+    document: {querySelectorAll: () => Object.values(ui), createElement: () => ({append(node) { this.child = node; }})},
+    location: new URL("chrome-extension://test/hls.html#tab=1&item=abc"),
     chrome: {runtime: {sendMessage: async () => ({ok: true, credentialOrigin: new URL(base).origin,
-      item: {name: "video", url: base, kind: "hls"}})}},
+      item: {name: "video", url: base, kind: "hls"}, alternatives: [{id: "variant-id", name: "index-v1-a1.m3u8"}]})}},
     Option: class {constructor(label, value) { this.label = label; this.value = value; }},
     window: {showSaveFilePicker: async args => { pickedNames.push(args.suggestedName); return handle; }}
   };
@@ -161,6 +166,7 @@ test("download page rolls back a partial response or cancellation and starts fro
     if (new URL(url).origin === new URL(base).origin && request.credentials !== "include") return new Response(null, {status: 401});
     if (url === second && request.credentials !== "omit") throw new Error("unexpected cross-origin credentials");
     if (url === base) {
+      if (mode === "master-failed") return new Response(null, {status: 403});
       const response = new Response("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=640x360\ntrack.m3u8");
       return Object.defineProperty(response, "url", {value: url});
     }
@@ -172,7 +178,15 @@ test("download page rolls back a partial response or cancellation and starts fro
     return new Response(ts);
   });
   await import("../extension/hls.js");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(ui.status.textContent, /播放清单读取失败。HTTP 403/);
+  assert.equal(ui.alternatives.hidden, false);
+  assert.equal(links[0].href, "chrome-extension://test/hls.html#tab=1&item=variant-id");
+  assert.equal(links[0].textContent, "index-v1-a1.m3u8");
+  mode = "partial";
+  await ui.retry.click();
   await prepared;
+  assert.equal(ui.alternatives.hidden, true);
   await ui.start.click();
   assert.match(ui.status.textContent, /部分/);
   assert.equal(committed.toString(), "previous file");
