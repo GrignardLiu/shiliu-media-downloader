@@ -5,7 +5,8 @@ const list = byId("list");
 const refreshButton = byId("refresh");
 const filters = byId("filters");
 const typeNames = { video: "视频", audio: "音频", stream: "流媒体" };
-const pending = new Set();
+const feedback = new Map();
+const downloads = new Map();
 let tabId;
 let items = [];
 let hasBlob = false;
@@ -58,6 +59,64 @@ function setStatus(message, tone = "") {
   byId("status").dataset.tone = tone;
 }
 
+function showFeedback(row, id) {
+  const state = feedback.get(id);
+  const note = row.querySelector(".transfer-status");
+  note.textContent = state?.message || "";
+  note.dataset.tone = state?.tone || "";
+  note.hidden = !state;
+  row.querySelector(".action").disabled = Boolean(state?.busy);
+}
+
+function setFeedback(id, message, tone = "", busy = false) {
+  feedback.set(id, {message, tone, busy});
+  for (const row of list.children) {
+    if (row.dataset.item === id) showFeedback(row, id);
+  }
+  setStatus(message, tone);
+}
+
+function interruption(reason) {
+  if (reason === "USER_CANCELED") return "已取消下载。";
+  if (["SERVER_FORBIDDEN", "SERVER_UNAUTHORIZED"].includes(reason)) {
+    return "网站拒绝了下载请求。请在原网页重新播放，获取新的下载地址。";
+  }
+  if (reason === "FILE_NO_SPACE") return "磁盘空间不足。请释放空间后重试。";
+  if (reason === "FILE_ACCESS_DENIED") return "浏览器无法写入下载目录，请检查保存位置。";
+  if (reason?.startsWith("NETWORK_")) return "网络请求中断。请检查网络后再试。";
+  return "下载已中断" + (reason ? "（" + reason + "）" : "") + "，可在浏览器下载记录中查看。";
+}
+
+async function updateDownload(downloadId) {
+  const id = downloads.get(downloadId);
+  if (!id) return;
+  // A download may finish or fail before downloads.download() returns its ID.
+  const [item] = await chrome.downloads.search({id: downloadId}).catch(() => []);
+  if (!downloads.has(downloadId)) return;
+  if (item?.state === "in_progress") {
+    setFeedback(id, item.paused ? "浏览器已暂停，可在下载记录中继续。" : "正在下载，可在浏览器下载记录中查看进度。", "", true);
+    return;
+  }
+  downloads.delete(downloadId);
+  if (item?.state === "interrupted") {
+    setFeedback(id, interruption(item.error), item.error === "USER_CANCELED" ? "" : "error");
+  } else if (item?.state === "complete") {
+    if (/^(?:text\/html|application\/(?:json|xhtml\+xml))\b/i.test(item.mime || "")) {
+      setFeedback(id, "服务器返回了网页或接口数据。请回原网页重新播放，再扫描媒体地址。", "error");
+    } else {
+      setFeedback(id, "已下载，可在浏览器下载记录中打开。", "success");
+    }
+  } else {
+    setFeedback(id, "已提交下载，请在浏览器下载记录中查看状态。");
+  }
+}
+
+chrome.downloads.onChanged.addListener(change => {
+  if (downloads.has(change.id) && (change.state || change.error || change.paused)) {
+    updateDownload(change.id);
+  }
+});
+
 function explainError(error, fallback) {
   const message = typeof error === "string" ? error : error?.message;
   // Browser-level exceptions can contain request URLs. Display our own localized fallback for those.
@@ -78,6 +137,7 @@ function makeRow(item) {
   const group = groupOf(item);
   const name = displayName(item);
   row.dataset.group = group;
+  row.dataset.item = item.id;
   row.querySelector(".media-icon use").setAttribute("href", "#i-" + group);
   const title = row.querySelector(".media-title");
   title.textContent = name;
@@ -88,7 +148,6 @@ function makeRow(item) {
   row.querySelector(".detail").title = detail;
 
   const action = row.querySelector(".action");
-  action.dataset.item = item.id;
   const isHls = item.kind === "hls";
   const label = isHls ? "打开" : item.kind === "dash" ? "保存清单" : "下载";
   const fullLabel = isHls ? "打开 HLS 下载页" : item.kind === "dash" ? "保存 DASH 播放清单" : "下载文件";
@@ -96,8 +155,9 @@ function makeRow(item) {
   action.querySelector("span").textContent = label;
   action.setAttribute("aria-label", fullLabel + "，" + name);
   action.title = fullLabel;
-  action.disabled = pending.has(item.id);
-  action.addEventListener("click", () => runAction(item, action));
+  const sourceTab = tabId;
+  action.addEventListener("click", () => runAction(item, sourceTab));
+  showFeedback(row, item.id);
   return row;
 }
 
@@ -123,28 +183,28 @@ function render() {
   }
 }
 
-async function runAction(item, button) {
-  if (pending.has(item.id)) return;
-  pending.add(item.id);
-  button.disabled = true;
-  setStatus("");
+async function runAction(item, sourceTab) {
+  if (feedback.get(item.id)?.busy) return;
+  setFeedback(item.id, item.kind === "hls" ? "正在打开下载页…" : "正在准备下载…", "", true);
   try {
     if (item.kind === "hls") {
-      const params = new URLSearchParams({ tab: String(tabId), item: item.id });
+      const params = new URLSearchParams({ tab: String(sourceTab), item: item.id });
       await chrome.tabs.create({ url: chrome.runtime.getURL("hls.html") + "#" + params });
+      setFeedback(item.id, "已打开 HLS 下载页，请在新页选择保存位置。", "success");
     } else {
-      const result = await chrome.runtime.sendMessage({ type: "DOWNLOAD_MEDIA", tabId, id: item.id });
+      const result = await chrome.runtime.sendMessage({ type: "DOWNLOAD_MEDIA", tabId: sourceTab, id: item.id });
       if (!result?.ok) throw new Error(result?.error || "下载请求失败，请重新扫描后再试。");
-      setStatus("已提交下载，可在浏览器的下载记录中查看。", "success");
+      if (result.opened) {
+        setFeedback(item.id, "已打开下载页，请在新页查看进度和保存位置。", "success");
+      } else if (Number.isInteger(result.downloadId)) {
+        downloads.set(result.downloadId, item.id);
+        await updateDownload(result.downloadId);
+      } else {
+        throw new Error("浏览器未确认下载，请重新扫描后再试。");
+      }
     }
   } catch (error) {
-    setStatus(explainError(error, "操作失败，请重新扫描后再试。"), "error");
-  } finally {
-    pending.delete(item.id);
-    // The user can change filters or rescan while a save dialog is open.
-    for (const action of list.querySelectorAll(".action:disabled")) {
-      if (action.dataset.item === item.id) action.disabled = false;
-    }
+    setFeedback(item.id, explainError(error, "浏览器未能开始下载。请在原网页重新播放，再扫描新的地址。"), "error");
   }
 }
 

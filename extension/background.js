@@ -17,6 +17,9 @@ const containerAliases = {mp4: ['m4v'], m4a: ['mp4'], weba: ['webm'], ogg: ['oga
   ogv: ['ogg'], mpeg: ['mpg'], aiff: ['aif']};
 const mediaMime = /^(?:audio|video)\/|mpegurl|dash\+xml|^application\/ogg$/;
 const pending = new Map();
+const requests = new Map();
+const mediaRequests = {urls: ['http://*/*', 'https://*/*'],
+  types: ['main_frame', 'sub_frame', 'media', 'xmlhttprequest', 'object', 'other']};
 const keyFor = tabId => 'media:' + tabId;
 const newState = () => ({route: '', since: 0, items: []});
 
@@ -161,7 +164,8 @@ function upsert(state, item, frameId, documentId, source, size = null, rank = 2)
   }
   // A page can link to hundreds of media files. Keep its player and captured
   // requests ahead of incidental links, with stable IDs across repeated scans.
-  const weight = row => row.url.length + row.name.length + 300;
+  const weight = row => row.url.length + row.name.length + (row.referrer?.length || 0) +
+    (row.requestOrigin?.length || 0) + 300;
   let chars = state.items.reduce((sum, row) => sum + weight(row), weight(item));
   if (state.items.length >= 120 || chars > 75000) {
     const byRank = [...state.items].sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0));
@@ -187,9 +191,40 @@ function headerSize(headers, status) {
   return Number.isSafeInteger(size) ? size : null;
 }
 
+function httpOrigin(value) {
+  if (typeof value !== 'string' || !/^https?:\/\//i.test(value)) return '';
+  try {
+    const url = new URL(value);
+    return !url.username && !url.password ? url.origin : '';
+  } catch { return ''; }
+}
+
+chrome.webRequest.onSendHeaders.addListener(details => {
+  const {requestId, tabId, method, requestHeaders, initiator} = details;
+  requests.delete(requestId); // Redirects can keep the ID and send different headers.
+  const source = httpOrigin(initiator);
+  if (tabId < 0 || method !== 'GET' || !source) return;
+  let referrer = '', requestOrigin = '', hadCookies = false;
+  for (const header of requestHeaders || []) {
+    const key = header.name.toLowerCase();
+    if (key === 'referer' && httpOrigin(header.value) === source) referrer = source + '/';
+    if (key === 'origin' && header.value === source) requestOrigin = source;
+    if (key === 'cookie') hadCookies = true;
+  }
+  // Never copy cookie values, authorization headers or the browsing URL. Keep
+  // only a bounded, in-memory record until we know this response is playable.
+  if (requests.size >= 2048) requests.delete(requests.keys().next().value);
+  requests.set(requestId, {target: httpOrigin(details.url), referrer, requestOrigin, hadCookies});
+}, mediaRequests, ['requestHeaders', 'extraHeaders']);
+
+chrome.webRequest.onErrorOccurred.addListener(({requestId}) => requests.delete(requestId), mediaRequests);
+
 chrome.webRequest.onHeadersReceived.addListener(details => {
   const {tabId, frameId, documentId, method, statusCode, type} = details;
-  if (tabId < 0 || method !== 'GET' || statusCode < 200 || statusCode >= 300) return;
+  const observed = requests.get(details.requestId);
+  requests.delete(details.requestId);
+  if (tabId < 0 || method !== 'GET' || statusCode < 200 || statusCode >= 300 ||
+      details.initiator === 'chrome-extension://' + chrome.runtime.id) return;
   const headers = {};
   for (const header of details.responseHeaders || []) {
     const key = header.name.toLowerCase();
@@ -200,6 +235,11 @@ chrome.webRequest.onHeadersReceived.addListener(details => {
   const item = describe(details.url, headers['content-type'],
     dispositionName(headers['content-disposition'] || ''), '', type);
   if (!item) return;
+  if (observed && observed.target === httpOrigin(item.url)) {
+    item.referrer = observed.referrer;
+    item.requestOrigin = observed.requestOrigin;
+    item.hadCookies = observed.hadCookies;
+  }
   inOrder(tabId, async () => {
     // A response can arrive after the page or iframe that initiated it is gone.
     if (documentId && !['main_frame','sub_frame'].includes(type)) {
@@ -211,8 +251,7 @@ chrome.webRequest.onHeadersReceived.addListener(details => {
       await saveState(tabId, state);
     }
   }).catch(console.warn);
-}, {urls: ['http://*/*','https://*/*'], types: ['main_frame','sub_frame','media','xmlhttprequest','object','other']},
-['responseHeaders']);
+}, mediaRequests, ['responseHeaders']);
 
 function route(url) {
   if (!/^https?:\/\//i.test(url)) return '';
@@ -231,6 +270,7 @@ async function routeKey(url) {
 chrome.webNavigation.onCommitted.addListener(event => {
   if (event.tabId < 0) return;
   inOrder(event.tabId, async () => {
+    if (event.frameId === 0) await clearDownloadRule(event.tabId);
     const state = await readState(event.tabId);
     const main = event.frameId === 0;
     const url = route(event.url);
@@ -270,7 +310,10 @@ chrome.webNavigation.onHistoryStateUpdated.addListener(updateRoute);
 chrome.webNavigation.onReferenceFragmentUpdated.addListener(updateRoute);
 
 chrome.tabs.onRemoved.addListener(tabId => {
-  inOrder(tabId, () => chrome.storage.session.remove(keyFor(tabId))).catch(console.warn);
+  inOrder(tabId, async () => {
+    await clearDownloadRule(tabId);
+    await chrome.storage.session.remove(keyFor(tabId));
+  }).catch(console.warn);
 });
 chrome.runtime.onInstalled.addListener(() => {
   chrome.action.setBadgeBackgroundColor({color: '#0F766E'});
@@ -318,7 +361,8 @@ async function listMedia(tabId) {
       if (!unique.has(item.url) || item.source === 'network') unique.set(item.url, item);
     }
     return {ok: true, hasBlob, scanBlocked: !scans.some(scan => scan.result),
-      items: [...unique.values()].map(({frameId, documentId, named, rank, ...item}) => item)};
+      items: [...unique.values()].map(({frameId, documentId, named, rank, referrer, requestOrigin,
+        hadCookies, ...item}) => item)};
   });
 }
 
@@ -333,9 +377,78 @@ async function getMedia(tabId, id) {
   return item;
 }
 
+// Session rules survive worker suspension. One ID per download tab makes
+// replace/remove atomic; the storage marker avoids DNR work on ordinary tabs.
+const ruleKey = tabId => 'download-rule:' + tabId;
+async function clearDownloadRule(tabId) {
+  const key = ruleKey(tabId);
+  if (!(await chrome.storage.session.get(key))[key]) return;
+  await chrome.declarativeNetRequest.updateSessionRules({removeRuleIds: [tabId + 1]});
+  await chrome.storage.session.remove(key);
+}
+
+async function isCurrentDownloadPage(sender) {
+  const tabId = sender.tab.id;
+  // webNavigation.getFrame does not reliably expose extension documents.
+  if (chrome.runtime.getContexts && sender.documentId) {
+    const contexts = await chrome.runtime.getContexts({contextTypes: ['TAB'],
+      tabIds: [tabId], documentIds: [sender.documentId]});
+    return contexts.length > 0;
+  }
+  // Chrome 106–115 can omit URL fields without the general tabs permission.
+  // The authenticated sender and the tab/initiator restrictions still apply.
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  return tab && (!tab.url || tab.url === sender.url) && (!tab.pendingUrl || tab.pendingUrl === sender.url);
+}
+
+async function prepareMedia(tabId, id, sender) {
+  const item = await getMedia(tabId, id);
+  const {referrer, requestOrigin, hadCookies, ...result} = item;
+  const page = item.kind === 'hls' ? 'hls.html' : 'file.html';
+  const url = new URL(sender.url);
+  const downloadTab = sender.tab?.id;
+  if (url.href.split('#')[0] !== chrome.runtime.getURL(page) || sender.frameId !== 0 ||
+      !Number.isInteger(downloadTab) || downloadTab < 0 || url.hash.length < 2) {
+    return {ok: true, item: result};
+  }
+  const target = new URLSearchParams(url.hash.slice(1));
+  if (target.get('tab') !== String(tabId) || target.get('item') !== id) throw new Error('下载页对应的资源已变更，请重新打开。');
+  const origin = httpOrigin(item.url);
+  await inOrder(downloadTab, async () => {
+    // A queued message from a page that already navigated away must not
+    // install a fresh rule after its navigation cleanup.
+    if (!await isCurrentDownloadPage(sender)) {
+      throw new Error('下载页已关闭或更新，请重新打开。');
+    }
+    if (!referrer && !requestOrigin) {
+      await clearDownloadRule(downloadTab);
+      return;
+    }
+    // DNR treats *, | and ^ as metacharacters in a urlFilter. Reject such
+    // hosts instead of broadening a rule for a nonstandard URL.
+    if (!origin || /[*|^]/.test(origin)) throw new Error('此媒体地址无法安全重用网页来源。');
+    const requestHeaders = [];
+    if (referrer) requestHeaders.push({header: 'Referer', operation: 'set', value: referrer});
+    if (requestOrigin) requestHeaders.push({header: 'Origin', operation: 'set', value: requestOrigin});
+    const ruleId = downloadTab + 1;
+    const rule = {id: ruleId, priority: 1, action: {type: 'modifyHeaders', requestHeaders},
+      condition: {tabIds: [downloadTab], initiatorDomains: [chrome.runtime.id], requestMethods: ['get'],
+        urlFilter: '|' + origin + '/', resourceTypes: ['xmlhttprequest']}};
+    const key = ruleKey(downloadTab);
+    await chrome.storage.session.set({[key]: true});
+    await chrome.declarativeNetRequest.updateSessionRules({removeRuleIds: [ruleId], addRules: [rule]});
+  });
+  return {ok: true, item: result, ...(hadCookies ? {credentialOrigin: origin} : {})};
+}
+
 async function downloadMedia(tabId, id) {
   const item = await getMedia(tabId, id);
   if (item.kind === 'hls') throw new Error('请打开 HLS 下载页面。');
+  if (item.referrer || item.requestOrigin) {
+    const params = new URLSearchParams({tab: String(tabId), item: id});
+    await chrome.tabs.create({url: chrome.runtime.getURL('file.html') + '#' + params});
+    return {ok: true, opened: true};
+  }
   const downloadId = await chrome.downloads.download({
     url: item.url, filename: item.name, conflictAction: 'uniquify',
   });
@@ -348,7 +461,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   let response;
   if (message.type === 'LIST_MEDIA') response = listMedia(message.tabId);
   else if (message.type === 'GET_MEDIA') {
-    response = getMedia(message.tabId, message.id).then(item => ({ok: true, item}));
+    response = prepareMedia(message.tabId, message.id, sender);
   } else if (message.type === 'DOWNLOAD_MEDIA') response = downloadMedia(message.tabId, message.id);
   else return;
   response.then(respond, error => respond({ok: false, error: error.message || '操作失败，请重试。'}));

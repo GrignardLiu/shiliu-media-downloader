@@ -1,3 +1,5 @@
+import {fetchMedia, httpFailure} from "./media-request.js";
+
 export const MAX_BYTES = 4 * 1024 ** 3;
 export const MAX_SEGMENT_BYTES = 512 * 1024 ** 2;
 const MAX_PLAYLIST_BYTES = 16 * 1024 ** 2;
@@ -152,11 +154,11 @@ export function parsePlaylist(source, base) {
   return {segments, init, duration};
 }
 
-export async function readResource(part, signal, maxBytes = MAX_SEGMENT_BYTES) {
+export async function readResource(part, signal, maxBytes = MAX_SEGMENT_BYTES, credentialOrigin) {
   const sizeError = maxBytes === MAX_SEGMENT_BYTES ? "单个分片超过 512 MiB 上限。" : "播放列表超出大小上限。";
   if (part.range && part.range.length > maxBytes) throw new Error(sizeError);
   const headers = part.range ? {Range: "bytes=" + part.range.start + "-" + part.range.end} : {};
-  const response = await fetch(part.url, {headers, signal, credentials: "omit", referrerPolicy: "no-referrer"});
+  const response = await fetchMedia(part.url, signal, credentialOrigin, headers);
   const fail = (message, retryable = false) => {
     response.body?.cancel().catch(() => {});
     const error = new Error(message);
@@ -164,8 +166,7 @@ export async function readResource(part, signal, maxBytes = MAX_SEGMENT_BYTES) {
     throw error;
   };
   if (!response.ok || !response.body) {
-    fail("服务器返回 HTTP " + response.status + "，请回原网页重新播放后再试。",
-      [408, 500, 502, 503, 504].includes(response.status));
+    fail(httpFailure(response.status), [408, 500, 502, 503, 504].includes(response.status));
   }
   let expectedSize;
   const encoding = response.headers.get("Content-Encoding")?.toLowerCase();
@@ -204,8 +205,8 @@ export async function readResource(part, signal, maxBytes = MAX_SEGMENT_BYTES) {
   return {blob: await new Response(checked).blob(), url: response.url};
 }
 
-export async function loadPlaylist(url, signal) {
-  const {blob, url: finalUrl} = await readResource({url: httpUrl(url)}, signal, MAX_PLAYLIST_BYTES);
+export async function loadPlaylist(url, signal, credentialOrigin) {
+  const {blob, url: finalUrl} = await readResource({url: httpUrl(url)}, signal, MAX_PLAYLIST_BYTES, credentialOrigin);
   return parsePlaylist(await blob.text(), finalUrl);
 }
 

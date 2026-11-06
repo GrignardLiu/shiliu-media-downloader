@@ -10,38 +10,49 @@ const base = 'https://media.test/';
 const tabId = 11;
 const doc = 'document-a';
 
-function browser() {
+function browser({legacyBrowser = false} = {}) {
   const events = {};
   const listener = name => ({addListener(fn) { events[name] = fn; }});
   const stored = {};
   const badges = new Map();
+  const rules = new Map();
   const frames = new Map([[0, {frameId: 0, documentId: doc}]]);
   const mock = {
     scans: [], blockedChild: false,
+    send(file, overrides = {}) {
+      events.sent({url: base + file, frameId: 0, tabId, documentId: doc, method: 'GET',
+        initiator: 'https://player.test', ...overrides});
+    },
     capture(file, overrides = {}) {
       events.headers({url: base + file, frameId: 0, tabId, documentId: doc, method: 'GET',
         statusCode: 200, type: 'xmlhttprequest', ...overrides});
     },
-    message(type, args = {}) {
-      const sender = {url: 'chrome-extension://local/popup.html'};
+    message(type, args = {}, sender = {url: 'chrome-extension://local/popup.html'}) {
       return new Promise(resolve => events.message({type, tabId, ...args}, sender, resolve));
     },
     list() { return this.message('LIST_MEDIA'); },
     dom(candidates) { this.scans = [{...frames.get(0), result: {hasBlob: false, candidates}}]; },
-    events, stored, badges, frames,
+    events, stored, badges, frames, rules,
   };
   const chrome = {
-    webRequest: {onHeadersReceived: listener('headers')},
+    webRequest: {onHeadersReceived: listener('headers'), onSendHeaders: listener('sent'),
+      onErrorOccurred: listener('requestError')},
     webNavigation: {
       onCommitted: listener('commit'), onHistoryStateUpdated: listener('history'),
       onReferenceFragmentUpdated: listener('hash'), getAllFrames: async () => {
         if (mock.frameBarrier) await mock.frameBarrier();
         return [...frames.values()];
       },
-      getFrame: async ({frameId}) => frames.get(frameId) || null,
+      getFrame: async ({tabId: requestedTab, frameId}) => requestedTab === tabId ? frames.get(frameId) || null : null,
     },
-    tabs: {onRemoved: listener('closed')},
-    runtime: {onInstalled: listener('installed'), onMessage: listener('message'), getURL: () => 'chrome-extension://local/'},
+    tabs: {onRemoved: listener('closed'), create: async ({url}) => { mock.opened = url; },
+      get: async id => mock.downloadFrames?.get(id) || null},
+    runtime: {id: 'local', onInstalled: listener('installed'), onMessage: listener('message'),
+      getURL: (p = '') => 'chrome-extension://local/' + p},
+    declarativeNetRequest: {updateSessionRules: async ({removeRuleIds, addRules = []}) => {
+      for (const id of removeRuleIds) rules.delete(id);
+      for (const rule of addRules) rules.set(rule.id, rule);
+    }},
     action: {setBadgeText: async ({tabId,text}) => badges.set(tabId,text)},
     storage: {session: {
       get: async key => structuredClone(key === null ? stored : {[key]: stored[key]}),
@@ -59,7 +70,11 @@ function browser() {
     }},
     downloads: {download: async options => { mock.download = options; return 37; }},
   };
-  vm.runInNewContext(source('background.js'), {chrome, URL, crypto: webcrypto, TextEncoder, btoa, console});
+  if (!legacyBrowser) chrome.runtime.getContexts = async ({tabIds, documentIds, contextTypes}) => {
+    const frame = mock.downloadFrames?.get(tabIds[0]);
+    return frame && contextTypes.includes('TAB') && documentIds.includes(frame.documentId) ? [frame] : [];
+  };
+  vm.runInNewContext(source('background.js'), {chrome, URL, URLSearchParams, crypto: webcrypto, TextEncoder, btoa, console});
   return mock;
 }
 
@@ -92,6 +107,87 @@ test('prefer declared format, preserve signed URL, filename, and full response s
   assert.equal((await b.message('DOWNLOAD_MEDIA', {id: result.id})).downloadId, 37);
   assert.equal(b.download.url, base + file);
   assert.equal(b.download.filename, '测试.ogg');
+});
+
+test('restore only observed origins for the selected download tab and exact CDN origin', async () => {
+  const b = browser();
+  const file = 'film.mp4?signature=a%2Fb';
+  const source = 'https://player.test';
+  b.send(file, {requestId: 'good', requestHeaders: [
+    {name: 'Referer', value: source + '/watch?private=page'}, {name: 'Origin', value: source},
+    {name: 'Cookie', value: 'secret-session'}, {name: 'Authorization', value: 'secret-token'}
+  ]});
+  b.capture(file, {requestId: 'good', responseHeaders: headers('video/mp4')});
+  const {items: [item]} = await b.list();
+  assert(!JSON.stringify(b.stored).match(/private=page|secret-session|secret-token/));
+  assert.equal(item.referrer, undefined);
+  const {opened} = await b.message('DOWNLOAD_MEDIA', {id: item.id});
+  assert.equal(opened, true);
+  const sender = {url: b.opened, frameId: 0, documentId: 'download', tab: {id: 50}};
+  b.downloadFrames = new Map([[50, {documentId: 'download'}]]);
+  const result = await b.message('GET_MEDIA', {id: item.id}, sender);
+  assert.equal(result.credentialOrigin, 'https://media.test');
+  assert.equal(result.item.url, base + file);
+  const rule = b.rules.get(51);
+  assert.deepEqual(Array.from(rule.condition.tabIds), [50]);
+  assert.deepEqual(Array.from(rule.condition.initiatorDomains), ['local']);
+  assert.equal(rule.condition.urlFilter, '|https://media.test/');
+  assert.deepEqual(Array.from(rule.action.requestHeaders, h => [h.header,h.value]),
+    [['Referer',source+'/'], ['Origin',source]]);
+  // Parallel exports do not share rules. Navigating one away cleans up only its rule.
+  b.downloadFrames.set(51, {documentId: 'download2'});
+  await b.message('GET_MEDIA', {id: item.id}, {...sender, tab: {id: 51}, documentId: 'download2'});
+  assert.equal(b.rules.size, 2);
+  b.events.commit({tabId: 50, frameId: 0, documentId: 'replacement', url: base+'elsewhere'});
+  b.downloadFrames.set(50, {documentId: 'replacement'});
+  assert.equal((await b.message('GET_MEDIA', {id: item.id}, sender)).ok, false);
+  assert.equal(b.rules.has(51), false);
+  assert.equal(b.rules.has(52), true);
+  b.events.closed(51);
+  await b.message('LIST_MEDIA', {tabId: 51});
+  assert.equal(b.rules.size, 0);
+});
+
+test('ignore unsuccessful, redirected and unrelated request contexts and untrusted senders', async () => {
+  const b = browser();
+  const observed = {requestHeaders: [{name: 'Referer', value: 'https://player.test/watch'}]};
+  b.send('bad.mp4', {requestId: 'bad', ...observed});
+  b.capture('bad.mp4', {requestId: 'bad', statusCode: 403});
+  b.send('redirect.mp4', {requestId: 'redirect', ...observed});
+  b.capture('redirect.mp4', {requestId: 'redirect', statusCode: 302});
+  b.capture('public.mp4', {requestId: 'redirect'});
+  b.send('public.mp4', {requestId: 'other', requestHeaders: [
+    {name: 'Referer', value: 'https://unrelated.test/private'}, {name: 'Origin', value: 'https://unrelated.test'}
+  ]});
+  b.capture('public.mp4', {requestId: 'other'});
+  const {items: [item]} = await b.list();
+  assert.equal(item.name, 'public.mp4');
+  assert.equal((await b.message('DOWNLOAD_MEDIA', {id: item.id})).downloadId, 37);
+  assert.equal(b.rules.size, 0);
+  b.send('index.m3u8', {requestId: 'hls', ...observed});
+  b.capture('index.m3u8', {requestId: 'hls', responseHeaders: headers('application/vnd.apple.mpegurl')});
+  const stream = (await b.list()).items.find(row => row.kind === 'hls');
+  const sender = {url: 'chrome-extension://local/hls.html#tab=11&item='+stream.id, frameId: 0,
+    tab: {id: 50}, documentId: 'hls-page'};
+  b.downloadFrames = new Map([[50, {documentId: 'hls-page'}]]);
+  assert.equal((await b.message('GET_MEDIA', {id: stream.id}, {...sender, frameId: 1})).credentialOrigin, undefined);
+  assert.equal(b.rules.size, 0);
+  assert.equal((await b.message('GET_MEDIA', {id: stream.id}, sender)).ok, true);
+  assert.equal(b.rules.size, 1);
+});
+
+test('older Chromium validates download tabs without webNavigation access to extension frames', async () => {
+  const b = browser({legacyBrowser: true});
+  b.send('old.mp4', {requestId: 'old', requestHeaders: [{name: 'Referer', value: 'https://player.test/watch'}]});
+  b.capture('old.mp4', {requestId: 'old'});
+  const {items: [item]} = await b.list();
+  const sender = {url: 'chrome-extension://local/file.html#tab=11&item='+item.id, frameId: 0,
+    documentId: 'old-page', tab: {id: 50}};
+  b.downloadFrames = new Map([[50, {url: sender.url, pendingUrl: 'https://elsewhere.test/'}]]);
+  assert.equal((await b.message('GET_MEDIA', {id: item.id}, sender)).ok, false);
+  b.downloadFrames.set(50, {url: sender.url});
+  assert.equal((await b.message('GET_MEDIA', {id: item.id}, sender)).ok, true);
+  assert.equal(b.rules.size, 1);
 });
 
 test('catalogue cap retains network and current player IDs; restricted iframe falls back to main document', async () => {

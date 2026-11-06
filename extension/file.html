@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文件下载 · 拾流</title>
+  <link rel="icon" href="icons/icon32.png">
+  <link rel="stylesheet" href="hls.css">
+  <script type="module" src="file.js"></script>
+</head>
+<body>
+  <main>
+    <header><img src="icons/icon48.png" alt="" width="32" height="32"><strong>拾流</strong></header>
+    <section aria-labelledby="heading">
+      <h1 id="heading">文件下载</h1>
+      <div class="source"><h2 id="title" dir="auto">正在读取媒体</h2><p id="site" dir="auto"></p></div>
+      <progress id="bar" hidden aria-label="文件下载进度"></progress>
+      <p id="status" role="status" aria-live="polite">正在读取资源…</p>
+      <div class="actions">
+        <button id="start" disabled>选择位置并下载</button>
+        <button id="cancel" class="secondary" hidden>取消</button>
+      </div>
+      <p class="save-hint">保存期间请保持此页打开。</p>
+    </section>
+  </main>
+</body>
+</html>

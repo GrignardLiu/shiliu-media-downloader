@@ -3,9 +3,9 @@
   "name": "拾流 · 网页影音下载器",
   "short_name": "拾流",
   "description": "发现当前网页中的视频和音频，下载媒体文件或保存未加密的 HLS 点播内容。",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "minimum_chrome_version": "106",
-  "permissions": ["webRequest", "webNavigation", "storage", "downloads", "scripting"],
+  "permissions": ["webRequest", "webNavigation", "storage", "downloads", "scripting", "declarativeNetRequestWithHostAccess"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": {
     "service_worker": "background.js"

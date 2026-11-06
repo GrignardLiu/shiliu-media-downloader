@@ -49,6 +49,33 @@ test("validates complete/ranged HTTP payloads, including decoded Content-Encodin
   assert.equal(await (await readResource(whole, ok())).blob.text(), "decoded text");
 });
 
+test("limits browser credentials to the observed media origin and follows redirects anonymously", async t => {
+  const origin = new URL(base).origin;
+  const foreign = "https://cdn.example/seg.ts";
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    calls.push([url, init.credentials, init.redirect]);
+    if (init.redirect === "manual") return Object.defineProperty(new Response(), "type", {value: "opaqueredirect"});
+    return new Response("part");
+  });
+  await readResource({url: base}, ok(), 32, origin);
+  await readResource({url: foreign}, ok(), 32, origin);
+  await readResource({url: base}, ok());
+  assert.deepEqual(calls, [
+    [base, "include", "manual"], [base, "omit", "follow"], [foreign, "omit", "follow"], [base, "omit", "follow"]
+  ]);
+});
+
+test("explains login, denied and precondition HTTP errors without exposing signed URLs", async t => {
+  let status;
+  t.mock.method(globalThis, "fetch", async () => new Response(null, {status}));
+  for (const [code, text] of [[401, /401.*登录/], [403, /403.*拒绝/], [412, /412.*来源/]]) {
+    status = code;
+    await assert.rejects(readResource({url: base + "?secret=private"}, ok()),
+      error => text.test(error.message) && !error.message.includes("secret"));
+  }
+});
+
 test("checks MP4 box boundaries, media data and protected sample entries without scanning media bytes", async () => {
   const header = box("ftyp", Buffer.from("iso6\0\0\0\0"));
   const entryCount = Buffer.from([0, 0, 0, 0, 0, 0, 0, 1]);
@@ -95,6 +122,7 @@ test("download page rolls back a partial response or cancellation and starts fro
   const ids = "start cancel retry track tracks track-hint bar summary status title site".split(" ");
   const ui = Object.fromEntries(ids.map(id => [id, {id, classList: {toggle() {}},
     addEventListener(event, fn) { this[event] = fn; }}]));
+  ui.track.replaceChildren = () => { ui.track.selectedIndex = 0; };
   Object.defineProperty(ui.start, "disabled", {set(value) { if (!value) ready(); }});
 
   let mode = "partial";
@@ -115,7 +143,9 @@ test("download page rolls back a partial response or cancellation and starts fro
   const globals = {
     document: {querySelectorAll: () => Object.values(ui)},
     location: {hash: "#tab=1&item=abc"},
-    chrome: {runtime: {sendMessage: async () => ({ok: true, item: {name: "video", url: base, kind: "hls"}})}},
+    chrome: {runtime: {sendMessage: async () => ({ok: true, credentialOrigin: new URL(base).origin,
+      item: {name: "video", url: base, kind: "hls"}})}},
+    Option: class {constructor(label, value) { this.label = label; this.value = value; }},
     window: {showSaveFilePicker: async args => { pickedNames.push(args.suggestedName); return handle; }}
   };
   for (const [name, value] of Object.entries(globals)) {
@@ -125,10 +155,17 @@ test("download page rolls back a partial response or cancellation and starts fro
   }
   const ts = Buffer.alloc(188);
   ts[0] = 0x47;
-  const second = new URL("two.ts", base).href;
-  t.mock.method(globalThis, "fetch", async url => {
+  const second = "https://cdn.example/two.ts";
+  const variant = new URL("track.m3u8", base).href;
+  t.mock.method(globalThis, "fetch", async (url, request) => {
+    if (new URL(url).origin === new URL(base).origin && request.credentials !== "include") return new Response(null, {status: 401});
+    if (url === second && request.credentials !== "omit") throw new Error("unexpected cross-origin credentials");
     if (url === base) {
-      const response = new Response(vod("#EXTINF:1,", "one.ts", "#EXTINF:1,", "two.ts"));
+      const response = new Response("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=640x360\ntrack.m3u8");
+      return Object.defineProperty(response, "url", {value: url});
+    }
+    if (url === variant) {
+      const response = new Response(vod("#EXTINF:1,", "one.ts", "#EXTINF:1,", second));
       return Object.defineProperty(response, "url", {value: url});
     }
     if (url === second && mode === "partial") return new Response(ts, {status: 206, headers: {"Content-Range": "bytes 0-187/376"}});
@@ -148,5 +185,5 @@ test("download page rolls back a partial response or cancellation and starts fro
   await ui.start.click();
   assert.match(ui.status.textContent, /已保存/);
   assert.deepEqual(committed, Buffer.concat([ts, ts]));
-  assert.deepEqual(pickedNames, ["video.ts", "video.ts", "video.ts"]);
+  assert.deepEqual(pickedNames, Array(3).fill("video - 640 × 360 · 1000 kbps.ts"));
 });

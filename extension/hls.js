@@ -1,4 +1,4 @@
-import {appendSegment, checkSegment, fileStem, httpUrl, loadPlaylist, readResource} from "./hls-core.js";
+import {MAX_SEGMENT_BYTES, appendSegment, checkSegment, fileStem, httpUrl, loadPlaylist, readResource} from "./hls-core.js";
 
 const el = Object.fromEntries([...document.querySelectorAll("[id]")].map(node => [node.id, node]));
 let resource;
@@ -58,7 +58,7 @@ function selectedAudio() {
 
 async function loadSelection() {
   const selected = options[el.track.selectedIndex];
-  const parsed = await loadPlaylist(selected.url, controller.signal);
+  const parsed = await loadPlaylist(selected.url, controller.signal, resource.credentialOrigin);
   if (parsed.options) throw new Error("暂不支持嵌套的多级主清单。");
   await preparePlaylist(parsed);
 }
@@ -77,7 +77,7 @@ async function readSelection(refreshRoot) {
     if (refreshRoot) {
       options = [];
       el.tracks.hidden = true;
-      const parsed = await loadPlaylist(resource.url, controller.signal);
+      const parsed = await loadPlaylist(resource.url, controller.signal, resource.credentialOrigin);
       if (!parsed.options) {
         await preparePlaylist(parsed);
         return;
@@ -101,7 +101,7 @@ async function readSelection(refreshRoot) {
 async function fetchPart(part, signal) {
   for (let attempt = 0; ; attempt++) {
     try {
-      return (await readResource(part, signal)).blob;
+      return (await readResource(part, signal, MAX_SEGMENT_BYTES, resource.credentialOrigin)).blob;
     } catch (error) {
       if (signal.aborted || attempt >= 2 || (!error.retryable && !(error instanceof TypeError))) throw error;
       status("分片请求中断，正在重试（" + (attempt + 1) + "/2）…");
@@ -200,8 +200,10 @@ async function initialize() {
     const id = params.get("item");
     if (!/^\d+$/.test(tab || "") || !id) throw new Error("请从拾流的页面资源列表打开 HLS 下载。");
     const result = await chrome.runtime.sendMessage({type: "GET_MEDIA", tabId: Number(tab), id});
-    if (!result?.ok || result.item?.kind !== "hls") throw new Error("该资源已失效。请在原网页重新扫描并打开。");
+    if (!result?.ok || result.item?.kind !== "hls") throw new Error(result?.error || "该资源已失效。请在原网页重新扫描并打开。");
     resource = {url: httpUrl(result.item.url), name: result.item.name || "媒体"};
+    const origin = new URL(resource.url).origin;
+    if (result.credentialOrigin === origin) resource.credentialOrigin = origin;
     el.title.textContent = resource.name;
     el.site.textContent = new URL(resource.url).host;
     await readSelection(true);

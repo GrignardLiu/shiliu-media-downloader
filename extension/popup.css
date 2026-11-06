@@ -176,10 +176,12 @@ h2 { font-size: 16px; font-weight: 700; }
 .empty-art .icon { width: 23px; height: 23px; stroke-width: 1.65; }
 .empty h3 { font-size: 14px; font-weight: 650; }
 .empty p { margin: 6px auto 0; max-width: 273px; color: var(--muted); font-size: 12px; line-height: 1.7; }
-.note, .status { margin: 9px 2px 0; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; color: var(--muted); }
-.status:empty { margin: 0; }
-.status[data-tone="error"] { color: #923d30; }
-.status[data-tone="success"] { color: var(--teal); }
+.note, .transfer-status { font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; color: var(--muted); }
+.note { margin: 9px 2px 0; }
+.transfer-status { grid-column: 1 / -1; margin: -3px 0 0; }
+.transfer-status[data-tone="error"] { color: #923d30; }
+.transfer-status[data-tone="success"] { color: var(--teal); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 @media (prefers-reduced-motion: no-preference) {
   .refresh[aria-busy="true"] .icon { animation: rotate .8s linear infinite; }
   @keyframes rotate { to { transform: rotate(360deg); } }

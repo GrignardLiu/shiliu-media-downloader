@@ -52,7 +52,7 @@
       </div>
     </div>
     <p id="blob-note" class="note" hidden>页面还使用了临时媒体地址。播放几秒后可重新扫描，查找对应的媒体源。</p>
-    <p id="status" class="status" role="status" aria-live="polite"></p>
+    <p id="status" class="sr-only" role="status" aria-live="polite"></p>
   </main>
 
   <template id="row-template">
@@ -65,6 +65,7 @@
       <button class="action" type="button">
         <svg class="icon" aria-hidden="true"><use></use></svg><span></span>
       </button>
+      <p class="transfer-status" hidden></p>
     </li>
   </template>
 </body>
