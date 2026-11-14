@@ -9,6 +9,7 @@ const feedback = new Map();
 const downloads = new Map();
 let tabId;
 let items = [];
+let allItems = [];
 let hasBlob = false;
 let scanBlocked = false;
 let filter = "all";
@@ -54,7 +55,7 @@ function readableSize(bytes) {
 function descriptionOf(item) {
   let host = "";
   try { host = new URL(item.url).hostname; } catch { /* A media type is sufficient. */ }
-  const detail = item.kind === "dash" ? "仅播放清单" : readableSize(item.size);
+  const detail = item.mergeAudioId ? "视频 + 音频 · 合并为 MP4" : item.kind === "dash" ? "仅播放清单" : readableSize(item.size);
   return [detail || typeNames[groupOf(item)], host].filter(Boolean).join(" · ");
 }
 
@@ -160,14 +161,21 @@ function makeRow(item) {
 
   const action = row.querySelector(".action");
   const isHls = item.kind === "hls";
-  const label = isHls ? "HLS 下载" : item.kind === "dash" ? "保存清单" : "下载";
-  const fullLabel = isHls ? "打开 HLS 下载页，有多档画质时可选择" : item.kind === "dash" ? "保存 DASH 播放清单" : "下载文件";
+  const label = item.mergeAudioId ? "合并下载" : isHls ? "HLS 下载" : item.kind === "dash" ? "保存清单" : "下载";
+  const fullLabel = item.mergeAudioId ? "合并画面和声音为一个 MP4" : isHls ? "打开 HLS 下载页，有多档画质时可选择" : item.kind === "dash" ? "保存 DASH 播放清单" : "下载文件";
   action.querySelector("use").setAttribute("href", isHls ? "#i-open" : "#i-download");
   action.querySelector("span").textContent = label;
   action.setAttribute("aria-label", fullLabel + "，" + name);
   action.title = fullLabel;
   const sourceTab = tabId;
   action.addEventListener("click", () => runAction(item, sourceTab));
+  const merge = row.querySelector(".merge-action");
+  merge.hidden = Boolean(item.mergeAudioId) || !ShiliuPairing.isMp4(item) ||
+    !items.some(other => other.id !== item.id && ShiliuPairing.isMp4(other));
+  merge.addEventListener("click", () => openMerge(item, sourceTab));
+  const original = row.querySelector(".original-action");
+  original.hidden = !item.mergeAudioId;
+  original.addEventListener("click", () => runAction({...item, mergeAudioId: undefined}, sourceTab));
   showFeedback(row, item.id);
   return row;
 }
@@ -178,7 +186,7 @@ function render() {
     button.setAttribute("aria-pressed", String(button.dataset.filter === filter));
   }
   byId("blob-note").hidden = !hasBlob || !items.length || items.some(item => item.kind === "hls");
-  const visible = items.filter((item) => filter === "all" || groupOf(item) === filter);
+  const visible = (filter === "audio" ? allItems : items).filter((item) => filter === "all" || groupOf(item) === filter);
   list.replaceChildren(...visible.map(makeRow));
   if (visible.length) {
     list.hidden = false;
@@ -198,7 +206,9 @@ async function runAction(item, sourceTab) {
   if (feedback.get(item.id)?.busy) return;
   setFeedback(item.id, item.kind === "hls" ? "正在打开下载页…" : "正在准备下载…", "", true);
   try {
-    if (item.kind === "hls") {
+    if (item.mergeAudioId) {
+      await openMerge(item, sourceTab);
+    } else if (item.kind === "hls") {
       const params = new URLSearchParams({ tab: String(sourceTab), item: item.id });
       await chrome.tabs.create({ url: chrome.runtime.getURL("hls.html") + "#" + params });
       setFeedback(item.id, "已打开 HLS 下载页，请在新页选择保存位置。", "success");
@@ -216,6 +226,17 @@ async function runAction(item, sourceTab) {
     }
   } catch (error) {
     setFeedback(item.id, explainError(error, "浏览器未能开始下载。请在原网页重新播放，再扫描新的地址。"), "error");
+  }
+}
+
+async function openMerge(item, sourceTab) {
+  try {
+    const params = new URLSearchParams({tab: String(sourceTab), item: item.id});
+    if (item.mergeAudioId) params.set("audio", item.mergeAudioId);
+    await chrome.tabs.create({url: chrome.runtime.getURL("merge.html") + "#" + params});
+    setFeedback(item.id, "已打开合并页，将视频和声音保存为一个 MP4。", "success");
+  } catch (error) {
+    setFeedback(item.id, explainError(error, "无法打开合并页，请重试。"), "error");
   }
 }
 
@@ -250,6 +271,9 @@ async function scan() {
     // A conventional master filename is a sorting hint. Only the HLS page parses the actual playlist.
     items = Array.isArray(result.items)
       ? result.items.slice().sort((a, b) => Number(hasMasterName(b)) - Number(hasMasterName(a))) : [];
+    allItems = items;
+    const pairedAudio = new Set(items.map(item => item.mergeAudioId).filter(Boolean));
+    items = items.filter(item => !pairedAudio.has(item.id));
     hasBlob = Boolean(result.hasBlob);
     scanBlocked = Boolean(result.scanBlocked);
     filters.hidden = false;

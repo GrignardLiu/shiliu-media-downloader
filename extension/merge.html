@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>合并音视频 · 拾流</title>
+  <link rel="icon" href="icons/icon32.png">
+  <link rel="stylesheet" href="hls.css">
+  <script type="module" src="merge.js"></script>
+</head>
+<body>
+  <main>
+    <header><img src="icons/icon48.png" alt="" width="32" height="32"><strong>拾流</strong></header>
+    <section aria-labelledby="heading">
+      <h1 id="heading">合并音视频</h1>
+      <div class="source"><h2>把画面和声音保存到一个 MP4</h2><p id="site">在本机合并，保留原始画质。</p></div>
+      <div id="tracks">
+        <label for="video-track">画面来源</label><select id="video-track" disabled></select>
+        <p class="hint">选择只有画面的视频文件。</p>
+        <label for="audio-track" style="margin-top:18px">声音来源</label><select id="audio-track" disabled></select>
+        <p id="pair-note" class="hint">请选择同一段视频对应的声音，避免选到预加载的其他内容。</p>
+      </div>
+      <progress id="bar" hidden aria-label="合并下载进度"></progress>
+      <p id="status" role="status" aria-live="polite">正在读取资源…</p>
+      <div class="actions">
+        <button id="start" disabled>选择位置并合并下载</button>
+        <button id="cancel" class="secondary" hidden>取消</button>
+      </div>
+      <p class="save-hint">保存期间请保持此页打开。下载的两个轨道会临时保存在浏览器中，完成或取消后清理。</p>
+    </section>
+  </main>
+</body>
+</html>

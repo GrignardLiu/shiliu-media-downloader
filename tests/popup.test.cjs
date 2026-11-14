@@ -59,7 +59,7 @@ async function popup({items, hasBlob = false} = {}) {
       onChanged: {addListener(fn) { api.changed = fn; }},
     },
   };
-  vm.runInNewContext(source('popup.js'), {
+  vm.runInNewContext(source('media-pairing.js') + '\n' + source('popup.js'), {
     chrome, document: {getElementById: id => elements[id]}, URL, URLSearchParams,
   });
   await tick();
@@ -83,6 +83,21 @@ test('an accepted download reports its real late failure on the same row, includ
   assert.match(ui.note(0).textContent, /网站拒绝/);
   assert.equal(ui.note(0).dataset.tone, 'error');
   assert.equal(ui.action(0).disabled, false);
+});
+
+test('a paired video opens merge once while original video and audio remain downloadable', async () => {
+  const ui = await popup({items: [
+    {id:'video',kind:'video',name:'v.mp4',extension:'mp4',url:'https://cdn.test/v.mp4',mergeAudioId:'audio'},
+    {id:'audio',kind:'audio',name:'a.m4a',extension:'m4a',url:'https://cdn.test/a.m4a'},
+  ]});
+  assert.deepEqual(ui.rows(), ['video']);
+  assert.equal(ui.action(0).querySelector('span').textContent, '合并下载');
+  await ui.action(0).handlers.click();
+  assert.deepEqual(ui.opened, ['chrome-extension://test/merge.html#tab=7&item=video&audio=audio']);
+  ui.filter(1);
+  assert.deepEqual(ui.rows(), ['audio']);
+  await ui.action(0).handlers.click();
+  assert.deepEqual(ui.ids, [12]);
 });
 
 test('completion before the ID arrives is read back, with a sign-in page reported separately from valid media', async () => {

@@ -1,3 +1,4 @@
+importScripts('media-pairing.js');
 const videoExtensions = new Set('mp4 m4v webm mov mkv avi flv wmv mpeg mpg ogv 3gp ts'.split(' '));
 const audioExtensions = new Set('mp3 m4a aac ogg oga opus wav flac weba aif aiff amr ac3'.split(' '));
 const mimeExtensions = {
@@ -81,7 +82,9 @@ async function saveState(tabId, state) {
     }
     if (!saved) throw error;
   }
-  const count = new Set(state.items.map(item => item.url)).size;
+  const uniqueItems = [...new Map(state.items.map(item => [item.url, item])).values()];
+  const count = uniqueItems.length - ShiliuPairing.findPairs(uniqueItems)
+    .filter(pair => ShiliuPairing.isMp4(pair.video) && ShiliuPairing.isMp4(pair.audio)).length;
   await chrome.action.setBadgeText({tabId, text: count ? String(count) : ''}).catch(() => {});
 }
 
@@ -150,6 +153,13 @@ function describe(rawUrl, rawMime = '', suggested = '', hint = '', from = '') {
   return media(kind, extension);
 
   function media(kind, extension) {
+    if (['audio', 'video'].includes(kind)) {
+      const track = ShiliuPairing.classify({url: parsed.href, kind, mime}).track;
+      if (track === 'audio' && kind === 'video') {
+        kind = 'audio';
+        if (extension === 'mp4') extension = 'm4a';
+      }
+    }
     return {url: parsed.href, kind, extension, mime, named: Boolean(suggested),
       name: safeName(suggested || basename, extension, kind)};
   }
@@ -405,9 +415,12 @@ async function listMedia(tabId) {
     for (const item of state.items) {
       if (!unique.has(item.url) || item.source === 'network') unique.set(item.url, item);
     }
+    const pairs = new Map(ShiliuPairing.findPairs([...unique.values()])
+      .filter(pair => ShiliuPairing.isMp4(pair.video) && ShiliuPairing.isMp4(pair.audio))
+      .map(pair => [pair.video.id, pair.audio.id]));
     return {ok: true, hasBlob, scanBlocked: !scans.some(scan => scan.result),
       items: [...unique.values()].map(({frameId, documentId, named, rank, referrer, requestOrigin, playlistSeenAt,
-        hadCookies, ...item}) => item)};
+        hadCookies, ...item}) => ({...item, ...(pairs.has(item.id) ? {mergeAudioId: pairs.get(item.id)} : {})}))};
   });
 }
 
@@ -540,18 +553,26 @@ function recoverPlaylist(tabId, item, frame) {
   return probe.result;
 }
 
-async function prepareMedia(tabId, id, sender) {
+async function prepareMedia(tabId, id, sender, forMerge = false) {
   const {item, items, frame} = await getMedia(tabId, id);
   const {referrer, requestOrigin, hadCookies, playlistSeenAt, ...result} = item;
-  const page = item.kind === 'hls' ? 'hls.html' : 'file.html';
+  const page = forMerge ? 'merge.html' : item.kind === 'hls' ? 'hls.html' : 'file.html';
   const url = new URL(sender.url);
   const downloadTab = sender.tab?.id;
   if (url.href.split('#')[0] !== chrome.runtime.getURL(page) || sender.frameId !== 0 ||
       !Number.isInteger(downloadTab) || downloadTab < 0 || url.hash.length < 2) {
+    if (forMerge) throw new Error('请从拾流打开音视频合并页。');
     return {ok: true, item: result};
   }
   const target = new URLSearchParams(url.hash.slice(1));
-  if (target.get('tab') !== String(tabId) || target.get('item') !== id) throw new Error('下载页对应的资源已变更，请重新打开。');
+  if (target.get('tab') !== String(tabId) || (!forMerge && target.get('item') !== id)) throw new Error('下载页对应的资源已变更，请重新打开。');
+  if (forMerge) {
+    const anchor = (await getMedia(tabId, target.get('item'))).item;
+    if (!ShiliuPairing.isMp4(item) || !ShiliuPairing.isMp4(anchor) ||
+        item.frameId !== anchor.frameId || item.documentId !== anchor.documentId) {
+      throw new Error('请选择同一播放器页面中的 MP4 视频和音频。');
+    }
+  }
   const origin = httpOrigin(item.url);
   let context = {referrer, requestOrigin};
   if (item.kind === 'hls' && item.source === 'page' && item.documentId && frame.documentId === item.documentId &&
@@ -613,6 +634,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (message.type === 'LIST_MEDIA') response = listMedia(message.tabId);
   else if (message.type === 'GET_MEDIA') {
     response = prepareMedia(message.tabId, message.id, sender);
+  } else if (message.type === 'GET_MERGE_MEDIA') {
+    response = prepareMedia(message.tabId, message.id, sender, true);
   } else if (message.type === 'DOWNLOAD_MEDIA') response = downloadMedia(message.tabId, message.id);
   else return;
   response.then(respond, error => respond({ok: false, error: error.message || '操作失败，请重试。'}));

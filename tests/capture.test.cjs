@@ -76,8 +76,10 @@ function browser({legacyBrowser = false} = {}) {
     const frame = mock.downloadFrames?.get(tabIds[0]);
     return frame && contextTypes.includes('TAB') && documentIds.includes(frame.documentId) ? [frame] : [];
   };
-  vm.runInNewContext(source('background.js'), {chrome, URL, URLSearchParams, crypto: webcrypto, TextEncoder, btoa,
+  const context = vm.createContext({chrome, URL, URLSearchParams, crypto: webcrypto, TextEncoder, btoa,
     setTimeout, clearTimeout, console});
+  context.importScripts = name => vm.runInContext(source(name), context);
+  vm.runInContext(source('background.js'), context);
   return mock;
 }
 
@@ -87,6 +89,46 @@ function headers(mime, more = {}) {
 function candidate(file, from='element', kind='video') {
   return {url: base + file, from, kind, mime: '', time: 0};
 }
+
+test('split MP4 hints classify audio and pair only the same Douyin content and document', async () => {
+  const b = browser();
+  const video = 'https://v26.douyinvod.com/video.mp4?vid=clip_123&mime_type=video_mp4';
+  const audio = 'https://v26.douyinvod.com/audio.mp4?vid=clip_123&mime_type=audio_mp4';
+  const other = 'https://v26.douyinvod.com/other.mp4?vid=clip_456&mime_type=audio_mp4';
+  for (const url of [video,audio,other]) b.capture('', {url, responseHeaders: headers('video/mp4')});
+  const {items} = await b.list();
+  const a = items.find(item => item.url === audio), v = items.find(item => item.url === video);
+  assert.equal(a.kind, 'audio');
+  assert.equal(a.extension, 'm4a');
+  assert.equal(v.mergeAudioId, a.id);
+  assert.equal(items.find(item => item.url === other).mergeAudioId, undefined);
+  assert.equal(b.badges.get(tabId), '2');
+});
+
+test('merge pages may prepare only stored MP4s in the anchored document and current download tab', async () => {
+  const b = browser();
+  b.frames.set(1, {frameId: 1, documentId: 'other-frame'});
+  for (const file of ['video.mp4','audio.m4a']) {
+    b.send(file, {requestId: file, requestHeaders: headers('', {Origin: 'https://player.test', Referer: 'https://player.test/'})});
+    b.capture(file, {requestId: file, responseHeaders: headers(file.endsWith('m4a') ? 'audio/mp4' : 'video/mp4')});
+  }
+  b.capture('other.m4a', {frameId: 1, documentId: 'other-frame', responseHeaders: headers('audio/mp4')});
+  const {items} = await b.list();
+  const [video,audio,other] = ['video.mp4','audio.m4a','other.m4a'].map(name => items.find(item => item.url.endsWith(name)));
+  b.downloadFrames = new Map([[52, {documentId: 'download'}]]);
+  const sender = {url: 'chrome-extension://local/merge.html#tab=11&item='+video.id,
+    frameId: 0, documentId: 'download', tab: {id: 52}};
+  const ok = await b.message('GET_MERGE_MEDIA', {id: audio.id}, sender);
+  assert.equal(ok.ok, true);
+  assert.equal(b.rules.size, 1);
+  for (const [id, source] of [
+    [other.id,sender], ['https://arbitrary.test/file.mp4',sender],
+    [audio.id,{...sender,frameId:1}],
+    [audio.id,{...sender,url:sender.url.replace('merge.html','popup.html')}],
+    [audio.id,{...sender,url:sender.url.replace('tab=11','tab=12')}],
+    [audio.id,{...sender,documentId:'stale'}],
+  ]) assert.equal((await b.message('GET_MERGE_MEDIA', {id}, source)).ok, false);
+});
 
 test('only a readable original-document HLS GET can restore timing-only request context', async () => {
   const file = 'movie/master.m3u8?sig=keep%2Fexact';

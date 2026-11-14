@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>拾流 · 页面媒体</title>
   <link rel="stylesheet" href="popup.css">
+  <script defer src="media-pairing.js"></script>
   <script defer src="popup.js"></script>
 </head>
 <body>
@@ -65,6 +66,8 @@
       <button class="action" type="button">
         <svg class="icon" aria-hidden="true"><use></use></svg><span></span>
       </button>
+      <button class="merge-action" type="button" hidden>合并音视频</button>
+      <button class="original-action merge-action" type="button" hidden>下载原文件</button>
       <p class="transfer-status" hidden></p>
     </li>
   </template>

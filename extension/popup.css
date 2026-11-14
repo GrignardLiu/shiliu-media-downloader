@@ -190,3 +190,4 @@ h2 { font-size: 16px; font-weight: 700; }
   .filters button[aria-pressed="true"] { outline: 1px solid Highlight; }
   .action, .format { border: 1px solid ButtonText; }
 }
+.merge-action { grid-column: 2 / -1; justify-self: end; padding: 4px 8px; border: 1px solid #bdcfc4; border-radius: 6px; background: transparent; color: #096a5b; font: inherit; cursor: pointer; }
