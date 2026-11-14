@@ -1,4 +1,5 @@
 // node tests/browser-merge.mjs <desktop Chrome or Edge executable>; requires ffmpeg and ffprobe on PATH.
+// Optional --fragment-video and --ordinary-audio exercise alternate MP4 layouts.
 // Uses only ephemeral profiles, loopback servers, and the browser's private CDP pipe.
 import assert from "node:assert/strict";
 import {execFileSync, spawn} from "node:child_process";
@@ -72,9 +73,9 @@ try {
   const videoFile = path.join(fixtureDir, 'video.mp4');
   const audioFile = path.join(fixtureDir, 'audio.mp4');
   execFileSync('ffmpeg', ['-nostdin','-v','error','-f','lavfi','-i','testsrc2=size=96x64:rate=12:duration=2',
-    '-an','-c:v','libx264','-pix_fmt','yuv420p','-preset','ultrafast',videoFile], {windowsHide:true});
+    '-an','-c:v','libx264','-pix_fmt','yuv420p','-preset','ultrafast',...(process.argv.includes('--fragment-video')?['-movflags','+frag_keyframe+empty_moov+default_base_moof']:[]),videoFile], {windowsHide:true});
   execFileSync('ffmpeg', ['-nostdin','-v','error','-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=2',
-    '-vn','-c:a','aac','-b:a','32k','-movflags','+frag_keyframe+empty_moov+default_base_moof',audioFile], {windowsHide:true});
+    '-vn','-c:a','aac','-b:a','32k',...(process.argv.includes('--ordinary-audio')?[]:['-movflags','+frag_keyframe+empty_moov+default_base_moof']),audioFile], {windowsHide:true});
   const video = await readFile(videoFile), audio = await readFile(audioFile);
   const pageLoopback = await serve((req,res) => {
     res.writeHead(200, {'Content-Type':'text/html','Referrer-Policy':'origin',
@@ -154,6 +155,31 @@ try {
   assert.equal(Number(v.nb_read_frames),24);assert.ok(Number(a.nb_read_frames)>=90);
   assert.ok(Math.abs(Number(report.format.duration)-2)<0.15);
   execFileSync('ffmpeg',['-nostdin','-v','error','-xerror','-i',output,'-map','0:v','-map','0:a','-f','null','-'],{windowsHide:true});
+  if (process.platform === 'win32') {
+    const native = JSON.parse(execFileSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+      fileURLToPath(new URL('./native-playback.ps1', import.meta.url)), output], {encoding:'utf8', windowsHide:true}));
+    assert.equal(native[0]?.Ok, true, 'Windows Media Foundation decodes and seeks both tracks');
+  }
+  const controlFile=path.join(fixtureDir,'ffmpeg-control.mp4');
+  execFileSync('ffmpeg',['-nostdin','-v','error','-i',videoFile,'-i',audioFile,'-map','0:v:0','-map','1:a:0','-c','copy',controlFile],{windowsHide:true});
+  async function playback(label, data) {
+    return evaluate(session,`(async()=>{
+      const v=document.createElement('video');v.muted=true;v.style.width='96px';v.style.height='64px';document.body.append(v);
+      const blob=new Blob([Uint8Array.from(atob(${JSON.stringify(data.toString('base64'))}),c=>c.charCodeAt(0))],{type:'video/mp4'});
+      const url=URL.createObjectURL(blob);const result={label:${JSON.stringify(label)}};
+      const wait=async(event)=>Promise.race([new Promise((resolve,reject)=>{v.addEventListener(event,resolve,{once:true});v.addEventListener('error',()=>reject(new Error('MediaError '+v.error?.code+': '+v.error?.message)),{once:true})}),new Promise((_,reject)=>setTimeout(()=>reject(new Error('timeout '+event)),5000))]);
+      try {const ready=wait('loadeddata');v.src=url;await ready;result.duration=v.duration;result.width=v.videoWidth;
+        await v.play();await new Promise(resolve=>setTimeout(resolve,350));result.decodedBeforeSeek=v.getVideoPlaybackQuality().totalVideoFrames;
+        const sought=wait('seeked');v.currentTime=Math.max(0,v.duration-0.4);await sought;const ended=wait('ended');await v.play();await ended;
+        result.decodedFrames=v.getVideoPlaybackQuality().totalVideoFrames;result.currentTime=v.currentTime;result.error=v.error?.message||null;
+      }catch(error){result.error=error.message;result.mediaError=v.error?{code:v.error.code,message:v.error.message}:null;}
+      finally{v.pause();v.remove();URL.revokeObjectURL(url)}return result;
+    })()`);
+  }
+  const playbackReports=[];
+  for(const [label,data] of [['source-video',video],['ffmpeg-control',await readFile(controlFile)],['merged',bytes]])playbackReports.push(await playback(label,data));
+  console.log('HTMLVideoElement',JSON.stringify(playbackReports));
+  for(const result of playbackReports){assert.equal(result.error,null,result.label+' playback: '+JSON.stringify(result));assert.ok(result.decodedBeforeSeek>0);assert.ok(result.decodedFrames>0);assert.equal(result.width,96);assert.ok(Math.abs(result.duration-2)<0.15);assert.ok(result.currentTime>=result.duration-0.1);}
   for(const url of [videoUrl,audioUrl])assert.ok(requests.some(r=>r.phase==='merge'&&r.url===new URL(url).pathname+new URL(url).search&&r.status===200),'authorized track fetched');
   assert.ok(!requests.some(r=>r.phase==='merge'&&r.url.startsWith('/unrelated.mp4')),'unrelated track never fetched');
   phase='picker-cancel';
@@ -163,7 +189,7 @@ try {
   assert.ok(!requests.some(r=>r.phase==='picker-cancel'),'canceling picker never downloads tracks');
   await call('Target.closeTarget',{targetId:target.targetId});
   await until(()=>evaluate(popup,'chrome.declarativeNetRequest.getSessionRules().then(r=>r.length===0)'),'merge rule cleanup');
-  console.log(version.product,'→ split-track pairing, isolated context, H264 + AAC merged MP4 decode passed;',bytes.length,'bytes');
+  console.log(version.product,'→ split-track pairing, isolated context, H264 + AAC merged MP4 decode/play/seek passed;',bytes.length,'bytes');
 } finally {
   if(call && browser.exitCode===null)await call('Browser.close').catch(()=>browser.kill());
   if(exit)await exit;

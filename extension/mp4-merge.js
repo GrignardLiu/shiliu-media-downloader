@@ -131,33 +131,23 @@ function container(type, parts) {
 /** Merge one video track and one audio track without decoding; timestamps/edit lists are preserved. */
 export async function mergeMp4(videoBlob, audioBlob, {signal, onProgress} = {}) {
   check(signal); onProgress?.({stage: "inspect", progress: 0});
-  const video = await inspect(videoBlob, signal), audio = await inspect(audioBlob, signal);
+  const video = await flatten(await inspect(videoBlob, signal), "vide", signal), audio = await flatten(await inspect(audioBlob, signal), "soun", signal);
   check(signal);
   const videoTrack = select(video, "vide"), audioTrack = select(audio, "soun");
   // Explicit brands avoid inheriting audio-only or source-specific compatibility claims.
   const ftyp = container("ftyp", [new Uint8Array([105,115,111,109,0,0,2,0,105,115,111,109,105,115,111,50,109,112,52,49])]);
-  const fragmentExtras = [...(video.fragmented ? fragmentDefaults(video, videoTrack, 1) : []), ...(audio.fragmented ? fragmentDefaults(audio, audioTrack, 2) : [])];
-  const moovLength = 8 + video.mvhd.size + videoTrack.size + audioTrack.size + (fragmentExtras.length ? 8 + fragmentExtras.reduce((sum, bytes) => sum + bytes.length, 0) : 0);
-  const parts = [ftyp], locations = new Map(); let position = ftyp.length + moovLength, sequence = 1;
+  const moovLength = 8 + video.mvhd.size + videoTrack.size + audioTrack.size;
+  if (moovLength > MAX_METADATA) fail("合并后的索引超过 32 MB，请使用 FFmpeg 合并。");
+  const parts = [ftyp], locations = new Map(); let position = ftyp.length + moovLength;
   for (const source of [video, audio]) {
     const list = []; locations.set(source, list);
-    const fragmentParts = []; let metadataBytes = 0;
-    for (const original of source.top.filter(box => ["moof", "mdat"].includes(box.type))) {
-      if (original.type === "moof") {
-        metadataBytes += original.size;
-        if (metadataBytes > MAX_METADATA) fail("分片索引累计超过 32 MB，请使用 FFmpeg 合并。");
-        check(signal);
-        const bytes = new Uint8Array(await source.blob.slice(original.start, original.end).arrayBuffer());
-        fragmentParts.push({bytes, original, position}); parts.push(bytes); position += bytes.length; continue;
-      }
-      // A size-zero mdat must receive a bounded header because more boxes follow it.
+    for (const original of source.mdats) {
+      check(signal);
+      // Bounded extended-size headers also make source size-zero mdats safe.
       const head = new Uint8Array(16); put32(head, 0, 1); head.set([109,100,97,116], 4); put64(head, 8, original.size - original.head + 16);
       list.push({original, start: position + 16 - original.head});
       parts.push(head, source.blob.slice(original.data, original.end)); position += 16 + original.size - original.head;
     }
-    const sourceId = source === video ? 1 : 2;
-    for (const fragment of fragmentParts) { check(signal); patchFragment(source, fragment, list, sourceId, sequence++); }
-
   }
   onProgress?.({stage: "index", progress: 0.5});
   const scale = video.timing.scale;
@@ -167,7 +157,7 @@ export async function mergeMp4(videoBlob, audioBlob, {signal, onProgress} = {}) 
   setDuration(mvhd, clock(mvhd, box, "mvhd"), Math.max(v.duration, a.duration));
   if (mvhd.length < (box.data + (mvhd[box.data] ? 112 : 100))) fail("电影头不完整。");
   put32(mvhd, mvhd.length - 4, 3);
-  parts.splice(1, 0, container("moov", [mvhd, v.bytes, a.bytes, ...(fragmentExtras.length ? [container("mvex", fragmentExtras)] : [])]));
+  parts.splice(1, 0, container("moov", [mvhd, v.bytes, a.bytes]));
   check(signal); const result = new Blob(parts, {type: "video/mp4"});
   onProgress?.({stage: "complete", progress: 1}); check(signal); return result;
 }
@@ -191,50 +181,6 @@ function trackId(source, track) {
   const tkhd = child(source.bytes, track, "tkhd");
   return u32(source.bytes, tkhd.data + (source.bytes[tkhd.data] ? 20 : 12));
 }
-function fragmentDefaults(source, track, id) {
-  const mvex = child(source.bytes, source.moov, "mvex"), old = trackId(source, track);
-  const entries = boxes(source.bytes, mvex.data, mvex.end).filter(box => box.type === "trex" && u32(source.bytes, box.data + 4) === old);
-  if (entries.length !== 1) fail("分片缺少唯一的轨道默认值。");
-  const bytes = source.bytes.slice(entries[0].start, entries[0].end), box = header(bytes, 0, bytes.length);
-  if (box.end - box.data !== 24) fail("分片默认值格式无效。");
-  put32(bytes, box.data + 4, id); return [bytes];
-}
-function patchFragment(source, fragment, locations, id, sequence) {
-  const {bytes, original, position} = fragment, root = header(bytes, 0, bytes.length);
-  const children = boxes(bytes, root.data, root.end), trafs = children.filter(box => box.type === "traf");
-  if (trafs.length !== 1) fail("暂不支持单个分片包含多轨道的 MP4，请使用 FFmpeg 合并。");
-  const mfhd = child(bytes, root, "mfhd"); put32(bytes, mfhd.data + 4, sequence);
-  const traf = trafs[0], items = boxes(bytes, traf.data, traf.end);
-  if (items.some(box => ["senc","saio","saiz"].includes(box.type))) fail("不支持加密分片。");
-  const tfhd = child(bytes, traf, "tfhd");
-  if (tfhd.data + 8 > tfhd.end) fail("分片头不完整。");
-  const flags = u32(bytes, tfhd.data) & 0xffffff, oldId = u32(bytes, tfhd.data + 4);
-  const selected = select(source, id === 1 ? "vide" : "soun");
-  if (oldId !== trackId(source, selected)) fail("分片包含额外轨道，请先使用 FFmpeg 提取所需轨道。");
-  put32(bytes, tfhd.data + 4, id);
-  let oldBase = original.start, newBase = position;
-  if (flags & 1) {
-    if (tfhd.data + 16 > tfhd.end) fail("分片绝对偏移不完整。");
-    oldBase = u64(bytes, tfhd.data + 8);
-    const media = locations.find(item => oldBase >= item.original.data && oldBase < item.original.end);
-    newBase = media ? media.start + oldBase - media.original.start : position + oldBase - original.start;
-    put64(bytes, tfhd.data + 8, newBase);
-  }
-  const runs = items.filter(box => box.type === "trun");
-  if (!runs.length) fail("分片缺少样本运行表。");
-  for (const run of runs) {
-    if (run.data + 12 > run.end || !(u32(bytes, run.data) & 1)) fail("暂不支持省略数据偏移的分片，请使用 FFmpeg 合并。");
-    const oldOffset = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(run.data + 8);
-    const oldData = oldBase + oldOffset;
-    const media = locations.find(item => oldData >= item.original.data && oldData < item.original.end);
-    if (!media) fail("分片样本偏移超出媒体数据范围。");
-    const delta = media.start + oldData - media.original.start - newBase;
-    if (!Number.isInteger(delta) || delta < -2147483648 || delta > 2147483647) fail("分片数据距离超出范围，请使用 FFmpeg 合并。");
-    new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setInt32(run.data + 8, delta);
-  }
-}
-
-
 // Read sample timing without retaining fragment metadata or reading media bytes.
 async function fragmentTiming(source, signal) {
   const ends = new Map(), decodeEnds = new Map(), defaults = new Map();
@@ -307,5 +253,126 @@ function presentationDuration(source, track) {
   }
   return Math.max(seconds, tkhd.duration / source.timing.scale);
 }
+
+
+function fullBox(type, fields, version = 0) {
+  const payload = new Uint8Array(4 + fields.length); payload[0] = version; payload.set(fields, 4); return container(type, [payload]);
+}
+function words(values) {
+  const bytes = new Uint8Array(values.length * 4); values.forEach((value, index) => put32(bytes, index * 4, value)); return bytes;
+}
+function replaceChild(bytes, parent, type, replacement) {
+  return container(parent.type, boxes(bytes, parent.data, parent.end).flatMap(box => box.type === type ? [replacement] : [bytes.slice(box.start, box.end)]));
+}
+function compactRuns(values) {
+  const runs = [];
+  for (const value of values) { const last = runs.at(-1); if (last && last[1] === value) last[0]++; else runs.push([1, value]); }
+  return runs;
+}
+// Flatten fragment timing and sample addresses to conventional MP4 sample tables.
+// This avoids mixed/fragmented layouts that Windows Media Foundation may open
+// successfully yet expose as an empty stream.
+async function flatten(source, kind, signal) {
+  if (!source.fragmented) return source;
+  const track = select(source, kind), id = trackId(source, track), mdia = child(source.bytes, track, "mdia");
+  const minf = child(source.bytes, mdia, "minf"), stbl = child(source.bytes, minf, "stbl"), stsz = child(source.bytes, stbl, "stsz");
+  if (stsz.data + 12 > stsz.end || u32(source.bytes, stsz.data + 8)) fail("暂不支持同一轨道混合初始样本与分片，请使用 FFmpeg 合并。");
+  const mvex = child(source.bytes, source.moov, "mvex"), trex = boxes(source.bytes, mvex.data, mvex.end).find(box => box.type === "trex" && u32(source.bytes, box.data + 4) === id);
+  if (!trex || trex.end - trex.data !== 24) fail("分片默认值不完整。");
+  const defaults = {description: u32(source.bytes, trex.data + 8), duration: u32(source.bytes, trex.data + 12), size: u32(source.bytes, trex.data + 16), flags: u32(source.bytes, trex.data + 20)};
+  const stsd = child(source.bytes, stbl, "stsd"), descriptions = boxes(source.bytes, stsd.data + 8, stsd.end);
+  const sizes = [], durations = [], compositions = [], sync = [], chunks = [];
+  let nextDts = 0, metadata = 0;
+  for (const original of source.top.filter(box => box.type === "moof")) {
+    check(signal); metadata += original.size;
+    if (metadata > MAX_METADATA) fail("分片索引累计超过 32 MB，请使用 FFmpeg 合并。");
+    const bytes = new Uint8Array(await source.blob.slice(original.start, original.end).arrayBuffer()), root = header(bytes, 0, bytes.length);
+    const trafs = boxes(bytes, root.data, root.end).filter(box => box.type === "traf");
+    if (trafs.length !== 1) fail("暂不支持单分片多轨道，请使用 FFmpeg 合并。");
+    const traf = trafs[0], items = boxes(bytes, traf.data, traf.end), tfhd = child(bytes, traf, "tfhd");
+    if (items.filter(box => box.type === "tfhd").length !== 1 || items.filter(box => box.type === "tfdt").length > 1) fail("分片头或解码时间戳重复。");
+    if (items.some(box => !["tfhd", "tfdt", "trun", "free"].includes(box.type))) fail("分片包含加密或额外样本元数据，请使用 FFmpeg 合并。");
+    if (tfhd.data + 8 > tfhd.end || bytes[tfhd.data] !== 0) fail("分片头格式无效。");
+    const mask = u32(bytes, tfhd.data) & 0xffffff;
+    if (mask & ~0x03003b) fail("分片头含不支持的标志。");
+    if (u32(bytes, tfhd.data + 4) !== id) fail("分片包含额外轨道，请使用 FFmpeg 提取所需轨道。");
+    let at = tfhd.data + 8, base = original.start, values = {...defaults};
+    if (mask & 1) { if (at + 8 > tfhd.end) fail("分片基地址不完整。"); base = u64(bytes, at); at += 8; }
+    for (const [flag, name] of [[2,"description"],[8,"duration"],[16,"size"],[32,"flags"]]) if (mask & flag) {
+      if (at + 4 > tfhd.end) fail("分片默认字段不完整。"); values[name] = u32(bytes, at); at += 4;
+    }
+    if (at !== tfhd.end || !values.description) fail("分片样本描述无效。");
+    const tfdt = items.find(box => box.type === "tfdt");
+    if (tfdt) {
+      const version = bytes[tfdt.data];
+      if (version > 1 || tfdt.end - tfdt.data !== (version ? 12 : 8)) fail("分片时间戳无效。");
+      const dts = version ? u64(bytes, tfdt.data + 4) : u32(bytes, tfdt.data + 4);
+      if (dts !== nextDts) fail("分片解码时间存在间隙、重叠或非零起点，请使用 FFmpeg 合并。");
+    }
+    for (const run of items.filter(box => box.type === "trun")) {
+      if (run.data + 12 > run.end) fail("分片运行表不完整。");
+      const flags = u32(bytes, run.data) & 0xffffff, version = bytes[run.data], count = u32(bytes, run.data + 4);
+      if (version > 1 || flags & ~0x000f05 || !(flags & 1) || (flags & 4 && flags & 1024)) fail("分片样本标志或数据偏移不受支持。");
+      // Bound worst-case generated stts/ctts/stsz/stss/co64/stsc before growing arrays.
+      const projectedMetadata = source.bytes.length + 256 + (sizes.length + count) * 24 + (chunks.length + 1) * 20;
+      if (sizes.length + count > 1000000 || projectedMetadata > MAX_METADATA) fail("生成的样本索引超过内存上限，请使用 FFmpeg 合并。");
+      let pos = run.data + 12;
+      const firstFlags = flags & 4 ? (pos + 4 <= run.end ? u32(bytes, pos) : fail("首样本标志不完整。")) : values.flags;
+      if (flags & 4) pos += 4;
+      const stride = [256,512,1024,2048].filter(flag => flags & flag).length * 4;
+      if (pos + count * stride !== run.end) fail("分片样本运行表长度无效。");
+      const offset = new DataView(bytes.buffer).getInt32(run.data + 8);
+      let address = base + offset, chunkBytes = 0;
+      for (let n = 0; n < count; n++) {
+        const take = () => { const value = u32(bytes, pos); pos += 4; return value; };
+        const duration = flags & 256 ? take() : values.duration;
+        const size = flags & 512 ? take() : values.size;
+        const sampleFlags = flags & 1024 ? take() : n === 0 ? firstFlags : values.flags;
+        let composition = flags & 2048 ? take() : 0;
+        if (version === 1 && composition > 0x7fffffff) fail("负组合时间偏移的分片需要使用 FFmpeg 合并，以保持音画时间一致。");
+        if (!duration || !size) fail("样本缺少有效时长或大小。");
+        durations.push(duration); sizes.push(size); compositions.push(composition);
+        if (!(sampleFlags & 0x10000)) sync.push(sizes.length);
+        nextDts += duration; chunkBytes += size;
+        if (!Number.isSafeInteger(nextDts) || !Number.isSafeInteger(chunkBytes)) fail("样本索引超出安全范围。");
+      }
+      if (count) {
+        const media = source.mdats.find(box => address >= box.data && address + chunkBytes <= box.end);
+        if (!media) fail("分片样本范围超出媒体数据。");
+        chunks.push({offset: address, count, description: values.description});
+      }
+    }
+  }
+  if (!sizes.length) fail("分片轨道没有可用样本。");
+
+  if (chunks.some(chunk => chunk.description > descriptions.length)) fail("样本描述索引超出范围。");
+  const tables = [source.bytes.slice(stsd.start, stsd.end)];
+  const timeRuns = compactRuns(durations);
+  tables.push(fullBox("stts", words([timeRuns.length, ...timeRuns.flat()])));
+  if (compositions.some(value => value !== 0)) {
+    const runs = compactRuns(compositions), signed = compositions.some(value => value < 0);
+    if (signed && compositions.some(value => value > 0x7fffffff)) fail("组合时间偏移超出范围。");
+    tables.push(fullBox("ctts", words([runs.length, ...runs.flatMap(([count,value]) => [count,value < 0 ? value + 4294967296 : value])]), signed ? 1 : 0));
+  }
+  tables.push(fullBox("stsz", words([0, sizes.length, ...sizes])));
+  const chunkRuns = [];
+  chunks.forEach((chunk,index) => { const prev = chunks[index - 1]; if (!prev || prev.count !== chunk.count || prev.description !== chunk.description) chunkRuns.push(index + 1, chunk.count, chunk.description); });
+  tables.push(fullBox("stsc", words([chunkRuns.length / 3, ...chunkRuns])));
+  const offsets = new Uint8Array(4 + chunks.length * 8); put32(offsets, 0, chunks.length);
+  chunks.forEach((chunk,index) => put64(offsets, 4 + index * 8, chunk.offset));
+  tables.push(fullBox("co64", offsets));
+  if (kind === "vide" && sync.length !== sizes.length) tables.push(fullBox("stss", words([sync.length, ...sync])));
+  const newStbl = container("stbl", tables), newMinf = replaceChild(source.bytes, minf, "stbl", newStbl);
+  const newMdia = replaceChild(source.bytes, mdia, "minf", newMinf);
+  const mdiaRoot = header(newMdia, 0, newMdia.length), mdhd = child(newMdia, mdiaRoot, "mdhd");
+  setDuration(newMdia, clock(newMdia, mdhd, "mdhd"), nextDts);
+  const newTrack = replaceChild(source.bytes, track, "mdia", newMdia);
+  const newBytes = container("moov", [source.bytes.slice(source.mvhd.start, source.mvhd.end), newTrack]);
+  const moov = header(newBytes, 0, newBytes.length);
+  return {...source, top: source.top.filter(box => box.type !== "moof"), bytes: newBytes, moov, mvhd: child(newBytes, moov, "mvhd"), tracks: [child(newBytes, moov, "trak")], fragmented: false};
+}
+
+
+
 
 

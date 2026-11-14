@@ -40,6 +40,29 @@ test("real MP4 retains packets and edit timing, decodes, rejects bad offsets/enc
    assert.deepEqual(actual.map(p=>[p.pts_time,p.dts_time,p.duration_time]),expected.map(p=>[p.pts_time,p.dts_time,p.duration_time]));
   }assert.deepEqual(ps.filter(p=>p.stream_index===0).map(p=>p.data_hash),packets(f).map(p=>p.data_hash));assert.equal(new Set(ps.map(p=>p.stream_index)).size,2);assert.deepEqual(ps.filter(p=>p.stream_index===1).map(p=>p.data_hash),packets(a).map(p=>p.data_hash));
  }
+ // Unsafe fragment timing and sample ranges must fail before producing a file.
+ const firstNonzero=Buffer.from(await readFile(f)),tfdt=firstNonzero.indexOf(Buffer.from("tfdt"));
+ assert.ok(tfdt>0); const timeAt=tfdt+8;
+ if(firstNonzero[tfdt+4]) firstNonzero.writeBigUInt64BE(1n,timeAt); else firstNonzero.writeUInt32BE(1,timeAt);
+ await assert.rejects(mergeMp4(new Blob([firstNonzero]),ab),/间隙|起点/);
+ const range=Buffer.from(await readFile(f)),runAt=range.indexOf(Buffer.from("trun"));
+ const mask=range.readUInt32BE(runAt+4)&0xffffff;assert.ok(mask&512);
+ let sampleAt=runAt+12+(mask&1?4:0)+(mask&4?4:0);
+ range.writeUInt32BE(0xffffffff,sampleAt+(mask&256?4:0));
+ await assert.rejects(mergeMp4(new Blob([range]),ab),/样本范围/);
+ const description=Buffer.from(await readFile(f)),trex=description.indexOf(Buffer.from("trex"));
+ assert.ok(trex>0);description.writeUInt32BE(2,trex+12);
+ await assert.rejects(mergeMp4(new Blob([description]),ab),/描述索引/);
+ const gaps=join(dir,"gap-source.mp4");run("ffmpeg",["-v","error","-i",v,"-c","copy","-movflags","frag_keyframe+empty_moov","-frag_duration","300000","-y",gaps]);
+ const gap=Buffer.from(await readFile(gaps)),second=gap.indexOf(Buffer.from("tfdt"),gap.indexOf(Buffer.from("tfdt"))+4);
+ assert.ok(second>0);if(gap[second+4])gap.writeBigUInt64BE(gap.readBigUInt64BE(second+8)+1n,second+8);else gap.writeUInt32BE(gap.readUInt32BE(second+8)+1,second+8);
+ await assert.rejects(mergeMp4(new Blob([gap]),ab),/间隙|重叠/);
+ const signed=join(dir,"signed-cto.mp4"),signedOut=join(dir,"signed-merged.mp4");
+ run("ffmpeg",["-v","error","-i",v,"-c","copy","-movflags","frag_keyframe+empty_moov+negative_cts_offsets","-y",signed]);
+ await assert.rejects(mergeMp4(new Blob([await readFile(signed)]),ab),/负组合时间偏移/);
+ // Every fragment input now yields a conventional MP4 with no moof/mvex.
+ for(const index of [0,1,2]) assert.equal((await inspectMp4(new Blob([await readFile(join(dir,`fragment-${index}.mp4`))]))).fragmented,false);
+
 });
 
 
