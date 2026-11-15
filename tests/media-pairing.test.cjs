@@ -46,3 +46,45 @@ test('host allowlist rejects suffix lookalikes and unrelated CDN vid parameters'
     assert.equal(findPairs([video, audio]).length, 0);
   }
 });
+
+test('multiple video qualities share a single reliable audio without inverse ambiguity', () => {
+  const video=row('video','vid=abc123&quality=1080');
+  const low=row('video','vid=abc123&quality=480');
+  const audio=row('audio','vid=abc123');
+  const pairs=findPairs([video,low,audio]);
+  assert.equal(pairs.length,2);assert.ok(pairs.every(pair=>pair.audio===audio));
+});
+
+test('owning-video audio metadata ranks AAC quality and backs off on unresolved track ties', () => {
+  const video=row('video','vid=abc123');
+  const meta={evidence:'douyin-video-object',codec:'aac',awemeId:'clip123'};
+  video.awemeId='clip123';
+  const low=row('audio','vid=abc123&audio=low',{...meta,bitrate:64000,audioGroup:'track-low'});
+  const high=row('audio','vid=abc123&audio=high',{...meta,bitrate:128000,audioGroup:'track-high'});
+  assert.equal(findPairs([video,low,high])[0].audio,high);
+  const backup=row('audio','vid=abc123&audio=backup',{...meta,bitrate:128000,audioGroup:'track-high'});
+  assert.equal(findPairs([video,low,high,backup])[0].audio,high);
+  backup.audioGroup='different-track';
+  assert.equal(findPairs([video,high,backup]).length,0);
+  const other=row('audio','vid=abc123&audio=wrong',{...meta,awemeId:'other123',bitrate:256000});
+  assert.equal(findPairs([video,high,other])[0].audio,high);
+});
+
+test('identifier contradictions are symmetric and metadata role beats generic video MIME', () => {
+  const video=row('video','vid=abc123&video_id=abc123');
+  const bad=row('audio','vid=abc123&video_id=other123');
+  assert.equal(findPairs([video,bad]).length,0);
+  const audio=row('video','vid=abc123',{mime:'video/mp4',metadataTrack:'audio',evidence:'douyin-video-object'});
+  assert.equal(classify(audio).track,'audio');assert.equal(findPairs([video,audio]).length,1);
+  audio.associationConflict=true;assert.equal(findPairs([video,audio]).length,0);
+});
+
+test('literal same-owner metadata overrides rendition vid while different owners cannot share audio', () => {
+  const metadata={evidence:'douyin-video-object',pairId:'owner123',awemeId:'owner123',contentId:'owner123'};
+  const video=row('video','vid=video-rendition',metadata);
+  const audio=row('audio','vid=audio-rendition',metadata);
+  assert.equal(findPairs([video,audio])[0].audio,audio);
+  audio.awemeId='other123';audio.pairId='other123';audio.contentId='other123';
+  audio.url=video.url.replace('/video.mp4','/audio.mp4');
+  assert.equal(findPairs([video,audio]).length,0);
+});

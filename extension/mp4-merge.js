@@ -1,5 +1,7 @@
 // Lossless ISO BMFF muxing. Media payloads remain Blob slices; only bounded moov/moof metadata is read.
 const MAX_METADATA = 32 * 1024 * 1024;
+const MAX_BOXES = 10000;
+const boxCaches = new WeakMap();
 const decoder = new TextDecoder("latin1");
 const fail = message => { throw new Error(`无法合并 MP4：${message}`); };
 function check(signal) { if (signal?.aborted) throw new DOMException("操作已取消", "AbortError"); }
@@ -24,8 +26,16 @@ function header(bytes, at, end) {
   return {type, start: at, size, head, data: at + head, end: at + size};
 }
 function boxes(bytes, start = 0, end = bytes.length) {
+  let cache = boxCaches.get(bytes);
+  if (!cache) { cache = {count: 0, ranges: new Map()}; boxCaches.set(bytes, cache); }
+  const key = start + ':' + end;
+  if (cache.ranges.has(key)) return cache.ranges.get(key);
   const result = [];
-  for (let at = start; at < end;) { const box = header(bytes, at, end); result.push(box); at = box.end; }
+  for (let at = start; at < end;) {
+    if (++cache.count > MAX_BOXES) fail("子盒数量超过上限，文件结构过于复杂。");
+    const box = header(bytes, at, end); result.push(box); at = box.end;
+  }
+  cache.ranges.set(key, result);
   return result;
 }
 function child(bytes, parent, type) { return boxes(bytes, parent.data, parent.end).find(box => box.type === type) || fail(`缺少 ${type} 数据。`); }
@@ -83,7 +93,13 @@ function rewrite(source, track, id, scale, locations) {
   const bytes = source.bytes.slice(track.start, track.end), root = header(bytes, 0, bytes.length);
   const tkhd = child(bytes, root, "tkhd"), timing = clock(bytes, tkhd, "tkhd");
   put32(bytes, tkhd.data + (timing.version ? 20 : 12), id);
-  const convert = value => Math.round(value * scale / source.timing.scale);
+  const convert = value => {
+    const numerator = BigInt(value) * BigInt(scale), denominator = BigInt(source.timing.scale);
+    if (numerator % denominator) fail("编辑时间无法在输出时间基准中准确表示。");
+    const result = Number(numerator / denominator);
+    if (!Number.isSafeInteger(result)) fail("编辑时间超出安全范围。");
+    return result;
+  };
   const duration = Math.round(presentationDuration(source, track) * scale);
   setDuration(bytes, timing, duration);
   const trackChildren = boxes(bytes, root.data, root.end);
@@ -114,6 +130,7 @@ function rewrite(source, track, id, scale, locations) {
   if (offsetsBox.data + 8 > offsetsBox.end) fail("媒体偏移表不完整。");
   const count = u32(bytes, offsetsBox.data + 4);
   if (offsetsBox.data + 8 + count * stride !== offsetsBox.end) fail("媒体偏移表长度无效。");
+  validateSamples(bytes, stbl, source.mdats, entries.length);
   for (let n = 0; n < count; n++) {
     const at = offsetsBox.data + 8 + n * stride, old = wide ? u64(bytes, at) : u32(bytes, at);
     const media = locations.find(location => old >= location.original.data && old < location.original.end);
@@ -122,8 +139,140 @@ function rewrite(source, track, id, scale, locations) {
   }
   return {bytes, duration};
 }
+// Validate conventional sample tables before copying media or relocating chunks.
+function validateSamples(bytes, stbl, mdats, descriptionCount) {
+  const tables = boxes(bytes, stbl.data, stbl.end);
+  const unique = type => {
+    const found = tables.filter(box => box.type === type);
+    if (found.length !== 1) fail("缺少唯一的 " + type + " 样本表。");
+    return found[0];
+  };
+  if (tables.some(box => box.type === 'stz2')) fail("暂不支持 stz2 紧凑样本大小表，请使用 FFmpeg 合并。");
+  const sizeBox = unique('stsz'), chunkBox = unique('stsc'), timeBox = unique('stts');
+  if (sizeBox.data + 12 > sizeBox.end) fail("样本大小表不完整。");
+  const fixed = u32(bytes, sizeBox.data + 4), samples = u32(bytes, sizeBox.data + 8);
+  if (samples > 1000000 || sizeBox.data + 12 + (fixed ? 0 : samples * 4) !== sizeBox.end) fail("样本大小表长度或数量无效。");
+  const counted = (box, stride) => {
+    if (box.data + 8 > box.end) fail("样本表不完整。");
+    const count = u32(bytes, box.data + 4);
+    if (box.data + 8 + count * stride !== box.end) fail("样本表长度无效。");
+    return count;
+  };
+  const times = counted(timeBox, 8); let timed = 0;
+  for (let n = 0; n < times; n++) timed += u32(bytes, timeBox.data + 8 + n * 8);
+  if (timed !== samples) fail("样本时长表与大小表数量不一致。");
+  for (const box of tables.filter(box => box.type === 'ctts')) {
+    const count = counted(box, 8); let composed = 0;
+    for (let n = 0; n < count; n++) composed += u32(bytes, box.data + 8 + n * 8);
+    if (composed !== samples) fail("组合时间表与样本数量不一致。");
+  }
+  const offsetBox = tables.find(box => ['co64', 'stco'].includes(box.type));
+  const wide = offsetBox.type === 'co64', chunks = counted(offsetBox, wide ? 8 : 4);
+  const runs = counted(chunkBox, 12);
+  let used = 0, run = 0, previousFirst = 0;
+  for (let n = 0; n < runs; n++) {
+    const at = chunkBox.data + 8 + n * 12, first = u32(bytes, at);
+    if ((!n && first !== 1) || first <= previousFirst || first > chunks || !u32(bytes, at + 4) ||
+        !u32(bytes, at + 8) || u32(bytes, at + 8) > descriptionCount) fail("样本到块映射无效。");
+    previousFirst = first;
+  }
+  if ((chunks && !runs) || (!chunks && (runs || samples))) fail("样本块数量无效。");
+  for (let n = 0; n < chunks; n++) {
+    if (run + 1 < runs && u32(bytes, chunkBox.data + 8 + (run + 1) * 12) === n + 1) run++;
+    const count = u32(bytes, chunkBox.data + 12 + run * 12);
+    if (used + count > samples) fail("样本块超出样本数量。");
+    let length = 0;
+    for (let i = 0; i < count; i++) length += fixed || u32(bytes, sizeBox.data + 12 + (used + i) * 4);
+    const at = offsetBox.data + 8 + n * (wide ? 8 : 4), offset = wide ? u64(bytes, at) : u32(bytes, at);
+    if (!Number.isSafeInteger(offset + length) || !mdats.some(box => offset >= box.data && offset + length <= box.end)) fail("样本块偏移或完整范围超出媒体数据。");
+    used += count;
+  }
+  if (used !== samples) fail("样本块与样本数量不一致。");
+}
+
+function movieScale(a, b) {
+  const gcd = (x, y) => y ? gcd(y, x % y) : x;
+  const scale = BigInt(a) / gcd(BigInt(a), BigInt(b)) * BigInt(b);
+  if (scale > 0xffffffffn) fail("两源电影时间基准无法无损合并，请使用 FFmpeg 合并。");
+  return Number(scale);
+}
+function upgradeClock(bytes, box, kind) {
+  if (bytes[box.data] === 1) return bytes.slice(box.start, box.end);
+  clock(bytes, box, kind);
+  const durationAt = kind === 'tkhd' ? 20 : 16;
+  const payload = new Uint8Array(box.end - box.data + 12); payload.set(bytes.subarray(box.data, box.data + 4)); payload[0] = 1;
+  put64(payload, 4, u32(bytes, box.data + 4)); put64(payload, 12, u32(bytes, box.data + 8));
+  payload.set(bytes.subarray(box.data + 12, box.data + durationAt), 20);
+  put64(payload, durationAt + 8, u32(bytes, box.data + durationAt));
+  payload.set(bytes.subarray(box.data + durationAt + 4, box.end), durationAt + 16);
+  return container(kind, [payload]);
+}
+// Fix all size-changing promotions before calculating the output media layout.
+function prepare(source, kind) {
+  const track = select(source, kind), mdia = child(source.bytes, track, 'mdia'), minf = child(source.bytes, mdia, 'minf'), stbl = child(source.bytes, minf, 'stbl');
+  const offset = boxes(source.bytes, stbl.data, stbl.end).find(box => box.type === 'stco');
+  const tkhd = child(source.bytes, track, 'tkhd');
+  const originalEdts = boxes(source.bytes, track.data, track.end).find(box => box.type === 'edts');
+  const originalElst = originalEdts && child(source.bytes, originalEdts, 'elst');
+  // Account for every widened field before allocating any promoted table or
+  // rebuilding its enclosing containers. Promotion never changes other sizes.
+  let projectedMoov = 8 + source.mvhd.size + track.size;
+  for (const box of [source.mvhd, tkhd]) {
+    clock(source.bytes, box, box === tkhd ? 'tkhd' : 'mvhd');
+    if (source.bytes[box.data] === 0) projectedMoov += 12;
+  }
+  if (offset) {
+    if (offset.data + 8 > offset.end) fail('媒体偏移表不完整。');
+    const count = u32(source.bytes, offset.data + 4);
+    if (offset.data + 8 + count * 4 !== offset.end) fail('媒体偏移表长度无效。');
+    projectedMoov += count * 4;
+  }
+  if (originalElst && source.bytes[originalElst.data] === 0) {
+    if (originalElst.data + 8 > originalElst.end) fail('编辑列表不完整。');
+    const count = u32(source.bytes, originalElst.data + 4);
+    if (originalElst.data + 8 + count * 12 !== originalElst.end) fail('编辑列表长度无效。');
+    projectedMoov += count * 8;
+  }
+  if (projectedMoov > MAX_METADATA) fail('提升后的索引超过 32 MB。');
+  let newStbl = source.bytes.slice(stbl.start, stbl.end);
+  if (offset) {
+    if (offset.data + 8 > offset.end) fail('媒体偏移表不完整。');
+    const count = u32(source.bytes, offset.data + 4);
+    if (offset.data + 8 + count * 4 !== offset.end) fail('媒体偏移表长度无效。');
+    const fields = new Uint8Array(4 + count * 8); put32(fields, 0, count);
+    for (let n = 0; n < count; n++) put64(fields, 4 + n * 8, u32(source.bytes, offset.data + 8 + n * 4));
+    newStbl = replaceChild(source.bytes, stbl, 'stco', fullBox('co64', fields));
+  }
+  const newMinf = replaceChild(source.bytes, minf, 'stbl', newStbl), newMdia = replaceChild(source.bytes, mdia, 'minf', newMinf);
+  let newTrack = replaceChild(source.bytes, track, 'mdia', newMdia), root = header(newTrack, 0, newTrack.length);
+  newTrack = replaceChild(newTrack, root, 'tkhd', upgradeClock(newTrack, child(newTrack, root, 'tkhd'), 'tkhd'));
+  root = header(newTrack, 0, newTrack.length);
+  const edts = boxes(newTrack, root.data, root.end).find(box => box.type === 'edts');
+  if (edts) {
+    const elst = child(newTrack, edts, 'elst');
+    if (newTrack[elst.data] === 0) {
+      if (elst.data + 8 > elst.end) fail('编辑列表不完整。');
+      const count = u32(newTrack, elst.data + 4);
+      if (elst.data + 8 + count * 12 !== elst.end) fail('编辑列表长度无效。');
+      const fields = new Uint8Array(4 + count * 20); put32(fields, 0, count);
+      for (let n = 0; n < count; n++) {
+        const at = elst.data + 8 + n * 12, out = 4 + n * 20;
+        put64(fields, out, u32(newTrack, at));
+        const media = u32(newTrack, at + 4); put32(fields, out + 8, media & 0x80000000 ? 0xffffffff : 0); put32(fields, out + 12, media);
+        fields.set(newTrack.subarray(at + 8, at + 12), out + 16);
+      }
+      newTrack = replaceChild(newTrack, root, 'edts', replaceChild(newTrack, edts, 'elst', fullBox('elst', fields, 1)));
+    }
+  }
+  const bytes = container('moov', [upgradeClock(source.bytes, source.mvhd, 'mvhd'), newTrack]);
+  if (bytes.length > MAX_METADATA) fail('提升后的索引超过 32 MB。');
+  const moov = header(bytes, 0, bytes.length), mvhd = child(bytes, moov, 'mvhd');
+  return {...source, bytes, moov, mvhd, tracks: [child(bytes, moov, 'trak')], timing: clock(bytes, mvhd, 'mvhd')};
+}
 function container(type, parts) {
-  const size = 8 + parts.reduce((sum, part) => sum + part.length, 0), bytes = new Uint8Array(size);
+  const size = 8 + parts.reduce((sum, part) => sum + part.length, 0);
+  if (size > MAX_METADATA) fail('生成的索引超过 32 MB。');
+  const bytes = new Uint8Array(size);
   put32(bytes, 0, size); bytes.set(new TextEncoder().encode(type), 4);
   let at = 8; for (const part of parts) { bytes.set(part, at); at += part.length; }
   return bytes;
@@ -131,7 +280,7 @@ function container(type, parts) {
 /** Merge one video track and one audio track without decoding; timestamps/edit lists are preserved. */
 export async function mergeMp4(videoBlob, audioBlob, {signal, onProgress} = {}) {
   check(signal); onProgress?.({stage: "inspect", progress: 0});
-  const video = await flatten(await inspect(videoBlob, signal), "vide", signal), audio = await flatten(await inspect(audioBlob, signal), "soun", signal);
+  const video = prepare(await flatten(await inspect(videoBlob, signal), "vide", signal), 'vide'), audio = prepare(await flatten(await inspect(audioBlob, signal), "soun", signal), 'soun');
   check(signal);
   const videoTrack = select(video, "vide"), audioTrack = select(audio, "soun");
   // Explicit brands avoid inheriting audio-only or source-specific compatibility claims.
@@ -150,10 +299,11 @@ export async function mergeMp4(videoBlob, audioBlob, {signal, onProgress} = {}) 
     }
   }
   onProgress?.({stage: "index", progress: 0.5});
-  const scale = video.timing.scale;
+  const scale = movieScale(video.timing.scale, audio.timing.scale);
   const v = rewrite(video, videoTrack, 1, scale, locations.get(video));
   const a = rewrite(audio, audioTrack, 2, scale, locations.get(audio));
   const mvhd = video.bytes.slice(video.mvhd.start, video.mvhd.end), box = header(mvhd, 0, mvhd.length);
+  put32(mvhd, box.data + (mvhd[box.data] ? 20 : 12), scale);
   setDuration(mvhd, clock(mvhd, box, "mvhd"), Math.max(v.duration, a.duration));
   if (mvhd.length < (box.data + (mvhd[box.data] ? 112 : 100))) fail("电影头不完整。");
   put32(mvhd, mvhd.length - 4, 3);

@@ -1,5 +1,7 @@
 import {MAX_SEGMENT_BYTES, appendSegment, checkSegment, fileStem, httpUrl, loadPlaylist, readResource} from "./hls-core.js";
 
+import {createHlsMp4Finalizer} from "./hls-mp4.js";
+
 const el = Object.fromEntries([...document.querySelectorAll("[id]")].map(node => [node.id, node]));
 let resource;
 let options = [];
@@ -127,6 +129,7 @@ function suggestedName() {
 
 async function saveParts(writable, signal) {
   let bytes = 0;
+  let finalizer;
   // The initialization part, when present, is written once before segment zero.
   const firstIndex = playlist.init ? -1 : 0;
   const stage = playlist.init && format.ext !== "ts" ? "fragment" : "media";
@@ -144,10 +147,18 @@ async function saveParts(writable, signal) {
       if (checked.ext !== format.ext) throw new Error("分片使用了不同的封装格式，无法合并。");
       data = checked.blob;
     }
+    if (playlist.init && format.ext !== "ts") {
+      if (index === -1) finalizer = await createHlsMp4Finalizer(data, signal);
+      else await finalizer.observe(data, signal);
+    }
     bytes = await appendSegment(writable, data, bytes, signal);
     el.bar.value = index + 1;
     status("已写入 " + (index + 1) + " / " + playlist.segments.length +
       " 个分片，" + (bytes / (1024 * 1024)).toFixed(1) + " MiB");
+  }
+  if (finalizer) {
+    status("正在完成 MP4 时长信息…");
+    await finalizer.finalize(writable, signal);
   }
 }
 

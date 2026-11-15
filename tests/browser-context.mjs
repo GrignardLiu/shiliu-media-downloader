@@ -47,10 +47,10 @@ async function makeMovie(dir) {
   routes["/" + variant] = ["application/vnd.apple.mpegurl", playlist];
   routes["/master.m3u8"] = ["application/vnd.apple.mpegurl",
     "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=128000,RESOLUTION=96x64\n" + variant];
-  return {routes, names, init, variant, expected: Buffer.concat(parts)};
+  return {routes, names, init, initSize: parts[0].length, variant, expected: Buffer.concat(parts)};
 }
 
-async function verifyMovie(bytes, dir) {
+async function verifyMovie(bytes, dir, original) {
   const output = path.join(dir, "saved.mp4");
   await writeFile(output, bytes);
   const report = JSON.parse(execFileSync("ffprobe", ["-v", "error", "-count_frames", "-show_entries",
@@ -64,6 +64,17 @@ async function verifyMovie(bytes, dir) {
   for (const duration of [video.duration, audio.duration, report.format.duration]) assert.ok(Math.abs(Number(duration) - 2) < 0.15);
   execFileSync("ffmpeg", ["-nostdin", "-v", "error", "-xerror", "-i", output, "-map", "0:v", "-map", "0:a", "-f", "null", "-"],
     {windowsHide: true});
+  const rawPath = path.join(dir, "original-hls.mp4");
+  await writeFile(rawPath, original);
+  const packets = file => JSON.parse(execFileSync("ffprobe", ["-v", "error", "-show_packets", "-show_data_hash", "sha256", "-of", "json", file],
+    {encoding: "utf8", windowsHide: true, maxBuffer: 4 * 1024 ** 2})).packets.map(packet => [packet.stream_index, packet.pts_time, packet.dts_time, packet.duration_time, packet.data_hash]);
+  assert.deepEqual(packets(output), packets(rawPath), "HLS finalization changed media packets or timestamps");
+  if (process.platform === "win32") {
+    const native = JSON.parse(execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", fileURLToPath(new URL("./native-playback.ps1", import.meta.url)), output],
+      {encoding: "utf8", windowsHide: true}));
+    assert.equal(native[0].Ok, true); assert.ok(native[0].Video.Duration >= 2);
+    assert.equal(native[0].Video.SeekChecked, true); assert.equal(native[0].Audio.SeekChecked, true);
+  }
   return `H.264 ${video.nb_read_frames} frames / AAC ${audio.nb_read_frames} frames / ${report.format.duration}s`;
 }
 
@@ -318,11 +329,36 @@ try {
     const saved = await evaluate(session, "fixtureHandle.getFile().then(f=>f.arrayBuffer()).then(b=>Array.from(new Uint8Array(b)))");
     const bytes = Buffer.from(saved);
     assert.equal(bytes.length, expected.length);
-    assert.equal(createHash("sha256").update(bytes).digest("hex"), createHash("sha256").update(expected).digest("hex"));
+    const hash = data => createHash("sha256").update(data).digest("hex");
+    if (name === "master.m3u8") {
+      assert.equal(hash(bytes.subarray(movie.initSize)), hash(expected.subarray(movie.initSize)), "Media fragments must remain byte-identical");
+      assert.notEqual(hash(bytes.subarray(0, movie.initSize)), hash(expected.subarray(0, movie.initSize)), "Initialization durations were not finalized");
+    } else assert.equal(hash(bytes), hash(expected));
     if (name === "master.m3u8") {
       const label = await evaluate(session, "fixtureHandle.name");
       assert.match(label, /\.mp4$/);
-      results.push(await verifyMovie(bytes, fixtureDir));
+      results.push(await verifyMovie(bytes, fixtureDir, expected));
+      if (!scenario) {
+        // Cancel during a positional metadata patch after an earlier successful
+        // commit. A real native writable must preserve that earlier file.
+        await evaluate(session, `window.fixtureOriginalWrite = FileSystemWritableFileStream.prototype.write;
+          FileSystemWritableFileStream.prototype.write = async function(data) {
+            const result = await fixtureOriginalWrite.call(this, data);
+            if (data?.type === "write") document.querySelector("#cancel").click();
+            return result;
+          };document.querySelector("#start").click()`);
+        await until(() => evaluate(session, "document.querySelector('#status')?.textContent === '已取消下载。'"), "fMP4 metadata cancellation");
+        const preserved = await evaluate(session, "fixtureHandle.getFile().then(f=>f.arrayBuffer()).then(b=>Array.from(new Uint8Array(b)))");
+        assert.equal(hash(Buffer.from(preserved)), hash(bytes), "Cancellation committed partial duration metadata");
+        await evaluate(session, "FileSystemWritableFileStream.prototype.write = fixtureOriginalWrite; document.querySelector('#start').click()");
+        await until(async () => {
+          const error = await evaluate(session, "document.querySelector('#status.error')?.textContent");
+          if (error) throw new Error(error);
+          return evaluate(session, "document.querySelector('#status')?.textContent.startsWith('已保存')");
+        }, "second fMP4 commit after consumed firstPart");
+        const repeated = await evaluate(session, "fixtureHandle.getFile().then(f=>f.arrayBuffer()).then(b=>Array.from(new Uint8Array(b)))");
+        assert.equal(hash(Buffer.from(repeated)), hash(bytes), "Repeated download reused stale initializer or changed output");
+      }
     }
     results.push((deniedMaster ? "403 → " + movie.variant : scenario === "timing" ? "timing/" + name : name) + "=" + saved.length + " verified bytes");
     if (deniedMaster) {

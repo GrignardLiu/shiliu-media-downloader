@@ -17,13 +17,17 @@ function browser({legacyBrowser = false} = {}) {
   const badges = new Map();
   const rules = new Map();
   const frames = new Map([[0, {frameId: 0, documentId: doc}]]);
+  const begun = new Set();
   const mock = {
+    begin(requestId, overrides = {}) { begun.add(requestId); events.before({requestId,tabId,method:"GET",timeStamp:Date.now(),...overrides}); },
     scans: [], blockedChild: false,
     send(file, overrides = {}) {
+      if (!begun.has(overrides.requestId)) this.begin(overrides.requestId, {timeStamp: overrides.timeStamp ?? Date.now()});
       events.sent({url: base + file, frameId: 0, tabId, documentId: doc, method: 'GET',
         initiator: 'https://player.test', ...overrides});
     },
     capture(file, overrides = {}) {
+      if (!begun.has(overrides.requestId) && !overrides.withoutStart) this.begin(overrides.requestId, {timeStamp: overrides.timeStamp ?? Date.now()});
       events.headers({url: base + file, frameId: 0, tabId, documentId: doc, method: 'GET',
         statusCode: 200, type: 'xmlhttprequest', ...overrides});
     },
@@ -35,7 +39,8 @@ function browser({legacyBrowser = false} = {}) {
     events, stored, badges, frames, rules,
   };
   const chrome = {
-    webRequest: {onHeadersReceived: listener('headers'), onSendHeaders: listener('sent'),
+    webRequest: {onBeforeRequest: listener('before'), onCompleted: listener('completed'),
+      onHeadersReceived: listener('headers'), onSendHeaders: listener('sent'),
       onErrorOccurred: listener('requestError')},
     webNavigation: {
       onCommitted: listener('commit'), onHistoryStateUpdated: listener('history'),
@@ -57,12 +62,13 @@ function browser({legacyBrowser = false} = {}) {
     storage: {session: {
       get: async key => structuredClone(key === null ? stored : {[key]: stored[key]}),
       set: async value => {
+        if (mock.startWriteBarrier && Object.keys(value).some(key => key.startsWith("request-start:"))) await mock.startWriteBarrier(value);
         if (mock.quota && Object.values({...stored, ...value}).filter(state => state.items?.length).length > mock.quota) {
           throw Error('QUOTA_BYTES quota exceeded');
         }
         Object.assign(stored, structuredClone(value));
       },
-      remove: async key => { delete stored[key]; },
+      remove: async key => { for (const entry of Array.isArray(key) ? key : [key]) delete stored[entry]; },
     }},
     scripting: {executeScript: async instruction => {
       const {target} = instruction;
@@ -76,10 +82,14 @@ function browser({legacyBrowser = false} = {}) {
     const frame = mock.downloadFrames?.get(tabIds[0]);
     return frame && contextTypes.includes('TAB') && documentIds.includes(frame.documentId) ? [frame] : [];
   };
+  const install = () => {
   const context = vm.createContext({chrome, URL, URLSearchParams, crypto: webcrypto, TextEncoder, btoa,
     setTimeout, clearTimeout, console});
   context.importScripts = name => vm.runInContext(source(name), context);
   vm.runInContext(source('background.js'), context);
+  };
+  mock.restart = install;
+  install();
   return mock;
 }
 
@@ -508,4 +518,295 @@ test('scan open shadow players and prefer observed MIME over a misleading player
   const {items} = await b.list();
   assert.equal(items.length, 2);
   assert(!items.some(i => i.url.endsWith('login.mp4')));
+});
+
+test('same-document SPA cutoffs reject late original and redirected requests across worker restarts', async () => {
+  const b = browser();
+  const nav = {tabId, frameId: 0, documentId: doc};
+  b.events.commit({...nav, url: base+'watch/one', timeStamp: 50});
+  await b.list();
+  b.send('old.mp4', {requestId:'old', timeStamp:100});
+  b.send('redirect.mp4', {requestId:'redirect', timeStamp:110});
+  b.events.history({...nav, url:base+'watch/two', timeStamp:200});
+  await b.list();
+  b.restart();
+  // A redirect after restart must retain the original request's persisted start.
+  b.begin('redirect', {timeStamp:250});
+  b.capture('old.mp4', {requestId:'old', timeStamp:300, responseHeaders:headers('video/mp4')});
+  b.capture('redirect-final.mp4', {requestId:'redirect', timeStamp:310, responseHeaders:headers('video/mp4')});
+  b.capture('unproven.mp4', {requestId:'unknown', withoutStart:true, responseHeaders:headers('video/mp4')});
+  assert.equal((await b.list()).items.length,0);
+  b.capture('current.mp4', {requestId:'new',timeStamp:400,responseHeaders:headers('video/mp4')});
+  const current=(await b.list()).items;
+  assert.deepEqual(current.map(i=>i.name),['current.mp4']);
+  assert.equal((await b.message('GET_MEDIA',{id:current[0].id})).ok,true);
+  b.events.completed({requestId:'new'});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(b.stored['request-start:new'],undefined);
+  b.events.requestError({requestId:'old'});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(b.stored['request-start:old'],undefined);
+});
+
+test('iframe SPA navigation clears only its own catalogue and filters its old timing buffer', async () => {
+  const b=browser();
+  const child={tabId,frameId:1,documentId:'child'};
+  b.frames.set(1,{frameId:1,documentId:'child'});
+  b.events.commit({...child,url:base+'embed/one',timeStamp:50});
+  b.capture('main.mp4',{requestId:'main',timeStamp:60,responseHeaders:headers('video/mp4')});
+  b.capture('child-old.mp4',{...child,requestId:'child-old',timeStamp:60,responseHeaders:headers('video/mp4')});
+  b.send('child-pending.mp4',{...child,requestId:'child-pending',timeStamp:100});
+  await b.list();
+  b.events.history({...child,url:base+'embed/two',timeStamp:200});
+  b.capture('child-pending.mp4',{...child,requestId:'child-pending',timeStamp:300,responseHeaders:headers('video/mp4')});
+  b.scans=[{frameId:1,documentId:'child',result:{hasBlob:false,candidates:[
+    {...candidate('child-old.mp4','timing'),time:60},
+    {...candidate('child-new.mp4','timing'),time:250},
+  ]}}];
+  const listed=(await b.list()).items;
+  assert.deepEqual(listed.map(i=>i.name),['main.mp4','child-new.mp4']);
+  // Out-of-order or obsolete-document route events must not clear the new state.
+  b.events.history({...child,url:base+'embed/old',timeStamp:150});
+  b.events.history({...child,documentId:'gone',url:base+'embed/gone',timeStamp:400});
+  assert.deepEqual((await b.list()).items.map(i=>i.id),listed.map(i=>i.id));
+});
+
+test('frame duplicate URLs preserve a complete pair while ordinary duplicates remain collapsed', async () => {
+  const b=browser();b.frames.set(1,{frameId:1,documentId:'child'});
+  const video='https://v26.douyinvod.com/v.mp4?vid=video123&mime_type=video_mp4';
+  const audio='https://v26.douyinvod.com/a.mp4?vid=video123&mime_type=audio_mp4';
+  for(const url of [video,audio]) b.capture('',{url,responseHeaders:headers('video/mp4')});
+  const first=(await b.list()).items;
+  const v=first.find(i=>i.url===video),a=first.find(i=>i.url===audio);
+  b.capture('',{url:video,frameId:1,documentId:'child',responseHeaders:headers('video/mp4')});
+  b.capture('ordinary.mp4',{responseHeaders:headers('video/mp4')});
+  b.capture('ordinary.mp4',{frameId:1,documentId:'child',responseHeaders:headers('video/mp4')});
+  let items=(await b.list()).items;
+  assert.equal(items.length,3);
+  assert.equal(items.find(i=>i.url===video).id,v.id);
+  assert.equal(items.find(i=>i.id===v.id).mergeAudioId,a.id);
+  b.downloadFrames=new Map([[52,{documentId:'download'}]]);
+  const sender={url:'chrome-extension://local/merge.html#tab=11&item='+v.id,frameId:0,documentId:'download',tab:{id:52}};
+  assert.equal((await b.message('GET_MERGE_MEDIA',{id:a.id},sender)).ok,true);
+  // Identical complete pairs in another frame still render as one complete pair.
+  b.capture('',{url:audio,frameId:1,documentId:'child',responseHeaders:headers('video/mp4')});
+  items=(await b.list()).items;
+  assert.equal(items.length,3);
+  assert.equal(items.find(i=>i.url===video).mergeAudioId,a.id);
+  assert.equal(b.badges.get(tabId),'2');
+});
+
+test('distinct complete pairs sharing a video retain only necessary context-specific duplicate rows', async () => {
+  const b=browser();b.frames.set(1,{frameId:1,documentId:'child'});
+  const video='https://v26.douyinvod.com/v.mp4?vid=video123&mime_type=video_mp4';
+  for(const [frameId,documentId,audio] of [[0,doc,'a'],[1,'child','b']]){
+    for(const url of [video,`https://v26.douyinvod.com/${audio}.mp4?vid=video123&mime_type=audio_mp4`])
+      b.capture('',{url,frameId,documentId,responseHeaders:headers('video/mp4')});
+  }
+  const items=(await b.list()).items;
+  assert.equal(items.length,4);
+  const videos=items.filter(i=>i.url===video);
+  assert.equal(videos.length,2);
+  assert.ok(videos.every(v=>v.mergeAudioId&&items.some(a=>a.id===v.mergeAudioId)));
+  assert.notEqual(videos[0].mergeAudioId,videos[1].mergeAudioId);
+  assert.equal(b.badges.get(tabId),'2');
+});
+
+test('legacy 1.3.1 session states upgrade lazily and retain SPA filtering after restart', async () => {
+  const b=browser();
+  b.stored['media:'+tabId]={route:'legacy-opaque-route',since:200,trackFragmentsChecked:true,items:[]};
+  b.capture('legacy-inflight.mp4',{requestId:'legacy',withoutStart:true,responseHeaders:headers('video/mp4')});
+  assert.equal((await b.list()).items.length,0);
+  b.capture('fresh.mp4',{requestId:'fresh',timeStamp:300,responseHeaders:headers('video/mp4')});
+  const fresh=(await b.list()).items[0];
+  assert.equal(fresh.name,'fresh.mp4');
+  b.events.history({tabId,frameId:0,documentId:doc,url:base+'next',timeStamp:400});
+  assert.equal((await b.list()).items.length,0);
+  b.restart();
+  b.capture('fresh-late.mp4',{requestId:'fresh',timeStamp:450,responseHeaders:headers('video/mp4')});
+  assert.equal((await b.list()).items.length,0);
+  assert.ok(b.stored['media:'+tabId].frameRoutes[0]);
+});
+
+test('request start records contain no URL or headers and close cleanup survives a worker restart', async () => {
+  const b=browser();
+  b.begin('owned',{frameId:3,timeStamp:123});
+  b.begin('other',{tabId:99,frameId:0,timeStamp:124});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(b.stored['request-start:owned'],{tabId,frameId:3,timeStamp:123});
+  b.restart();
+  b.events.closed(tabId);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(b.stored['request-start:owned'],undefined);
+  assert.deepEqual(b.stored['request-start:other'],{tabId:99,frameId:0,timeStamp:124});
+});
+
+test('completion and tab removal wait for pending request-start writes before cleanup', async () => {
+  for(const mode of ['completed','closed']){
+    const b=browser();let release,entered;
+    const blocked=new Promise(resolve=>{release=resolve});
+    const writing=new Promise(resolve=>{entered=resolve});
+    b.startWriteBarrier=async()=>{entered();await blocked};
+    b.begin('pending',{frameId:0,timeStamp:123});
+    await writing;
+    if(mode==='closed')b.events.closed(tabId);else b.events.completed({requestId:'pending'});
+    release();
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(b.stored['request-start:pending'],undefined,mode);
+  }
+});
+
+test('auto pairing authenticates anchor, re-scans, shares audio across qualities, and restricts auto preparation', async () => {
+  const b=browser();b.frames.set(1,{frameId:1,documentId:'child'});
+  const video='https://v26.douyinvod.com/v.mp4?vid=video123&mime_type=video_mp4';
+  const low='https://v26.douyinvod.com/v.mp4?vid=video123&mime_type=video_mp4&quality=low';
+  const audio='https://v26.douyinvod.com/a.mp4?vid=video123&mime_type=audio_mp4';
+  for(const url of [video,low])b.capture('',{url,responseHeaders:headers('video/mp4')});
+  const v=(await b.list()).items.find(i=>i.url===video);
+  b.downloadFrames=new Map([[52,{documentId:'download'}]]);
+  const sender={url:'chrome-extension://local/merge.html#tab=11&item='+v.id+'&mode=auto',frameId:0,documentId:'download',tab:{id:52}};
+  assert.equal((await b.message('GET_AUTO_PAIR',{id:v.id},sender)).reason,'none');
+  // The auto lookup itself scans the page, discovering a source not in the old popup list.
+  b.dom([{url:audio,kind:'audio',mime:'audio/mp4',from:'element'}]);
+  const matched=await b.message('GET_AUTO_PAIR',{id:v.id},sender);
+  assert.equal(matched.reason,'matched');assert.ok(matched.audioId);
+  assert.equal((await b.message('GET_MERGE_MEDIA',{id:matched.audioId},sender)).ok,true);
+  const items=(await b.list()).items;
+  assert.equal(items.filter(i=>i.kind==='video').length,1);
+  const rawLow=b.stored['media:'+tabId].items.find(i=>i.url===low);
+  assert.ok(rawLow,'actual observed rendition stays available internally');
+  assert.equal((await b.message('GET_AUTO_PAIR',{id:rawLow.id},{...sender,url:sender.url.replace(v.id,rawLow.id)})).audioId,matched.audioId);
+  assert.equal(b.badges.get(tabId),'1');
+  b.capture('unrelated.m4a',{responseHeaders:headers('audio/mp4')});
+  const unrelated=(await b.list()).items.find(i=>i.url.endsWith('unrelated.m4a'));
+  assert.equal((await b.message('GET_MERGE_MEDIA',{id:unrelated.id},sender)).ok,false);
+  for(const wrong of [{...sender,frameId:1},{...sender,url:sender.url.replace('item='+v.id,'item=other')},
+    {...sender,url:'chrome-extension://local/popup.html'},{...sender,documentId:'gone'}])
+    assert.equal((await b.message('GET_AUTO_PAIR',{id:v.id},wrong)).ok,false);
+  b.capture('',{url:audio+'&alt=1',responseHeaders:headers('video/mp4')});
+  assert.equal((await b.message('GET_AUTO_PAIR',{id:v.id},sender)).reason,'ambiguous');
+});
+
+test('page JSON associates literal per-resource IDs with captured URLs without borrowing source credentials', async () => {
+  const b=browser();
+  const video='https://cdn.test/opaque-video',audio='https://cdn.test/opaque-audio';
+  b.send('',{url:video,requestId:'v',requestHeaders:headers('',{Origin:'https://player.test',Referer:'https://player.test/'})});
+  b.capture('',{url:video,requestId:'v',responseHeaders:headers('video/mp4')});
+  // Even a misleading network MIME cannot erase parser-proven audio role.
+  b.capture('',{url:audio,responseHeaders:headers('video/mp4')});
+  const meta={from:'page-json',evidence:'douyin-video-object',awemeId:'clip123',contentId:'clip123',pairId:'clip123'};
+  b.dom([{url:video,kind:'video',mime:'video/mp4',...meta},
+    {url:audio,kind:'audio',mime:'audio/mp4',...meta,codec:'aac',bitrate:128000,audioGroup:'audio-clip123'}]);
+  const items=(await b.list()).items,v=items.find(i=>i.url===video),a=items.find(i=>i.url===audio);
+  assert.equal(v.mergeAudioId,a.id);assert.equal(a.kind,'audio');
+  const stored=b.stored['media:'+tabId].items.find(i=>i.id===a.id);
+  assert.equal(stored.referrer,undefined);assert.equal(stored.requestOrigin,undefined);assert.equal(stored.hadCookies,undefined);
+  // A subsequent network response must retain association and metadata audio role.
+  b.capture('',{url:audio,responseHeaders:headers('video/mp4')});
+  assert.equal((await b.list()).items.find(i=>i.id===v.id).mergeAudioId,a.id);
+});
+
+test('real RENDER_DATA content scan enriches the matching player and discovers only its own audio', async () => {
+  const video='https://cdn.test/opaque-video?vid=video-rendition&sig=Keep%2FExact';
+  const audio='https://cdn.test/opaque-audio?vid=audio-rendition&sig=Other%2fExact';
+  const payload={aweme_detail:{aweme_id:'7433333333333333333',video:{play_addr:{url_list:[video]},
+    bit_rate_audio:[{audio_meta:{codec_type:'aac',bitrate:128000,file_id:'track123',url_list:{main_url:audio}}}]},
+    music:{play_url:{url_list:['https://music.test/not-video-audio.mp3']}}}};
+  const player={localName:'video',currentSrc:video,getAttribute:()=>video,querySelectorAll:()=>[]};
+  const script={id:'RENDER_DATA',type:'',textContent:encodeURIComponent(JSON.stringify(payload))};
+  const document={URL:'https://www.douyin.com/video/7433333333333333333',baseURI:'https://www.douyin.com/',contentType:'text/html',
+    querySelectorAll:selector=>selector==='video, audio'?[player]:selector==='script'?[script]:[]};
+  const context=vm.createContext({document,performance:{timeOrigin:100,getEntriesByType:()=>[]},URL,atob});
+  vm.runInContext(source('page-media.js'),context);
+  const scanned=vm.runInContext(source('content.js'),context);
+  assert.equal(scanned.candidates.length,2);
+  const b=browser();b.scans=[{frameId:0,documentId:doc,result:scanned}];
+  const items=(await b.list()).items,v=items.find(i=>i.url===video),a=items.find(i=>i.url===audio);
+  assert.ok(v&&a);assert.equal(v.mergeAudioId,a.id);assert.equal(a.kind,'audio');
+  assert.equal(v.url,video);assert.equal(a.url,audio);
+});
+
+function scanObservedFixture({pageUrl='https://www.douyin.com/video/owner123', scripts=[], transport=null}={}) {
+  const node=transport&&{tagName:'SCRIPT',type:'application/json',textContent:JSON.stringify(transport)};
+  const document={URL:pageUrl,baseURI:pageUrl,contentType:'text/html',getElementById:()=>node,
+    querySelectorAll:selector=>selector==='script'?scripts:[]};
+  const context=vm.createContext({document,performance:{timeOrigin:100,getEntriesByType:()=>[]},URL,atob});
+  vm.runInContext(source('page-media.js'),context);
+  return vm.runInContext(source('content.js'),context);
+}
+
+test('observer transport accepts only bounded current-page, current-owner associations', () => {
+  const meta={evidence:'douyin-video-object',pairId:'dy-aweme-owner123',awemeId:'owner123',contentId:'owner123',observedAt:250};
+  const video={url:'https://cdn.test/video.mp4',kind:'video',mime:'video/mp4',...meta};
+  const audio={url:'https://cdn.test/audio.m4a',kind:'audio',mime:'audio/mp4',...meta};
+  const transport={version:1,pageUrl:'https://www.douyin.com/video/owner123',observedAt:300,candidates:[video,audio,
+    {...audio,url:'https://cdn.test/wrong.m4a',awemeId:'other123'},
+    {...audio,url:'https://cdn.test/too-old.m4a',observedAt:99},
+    {...audio,url:'https://cdn.test/future.m4a',observedAt:301}]};
+  const scanned=scanObservedFixture({transport});
+  assert.deepEqual(Array.from(scanned.candidates,c=>c.url),[video.url,audio.url]);
+  assert.ok(scanned.candidates.every(c=>c.metadataObservedAt===250&&c.metadataSource==='observer'));
+  assert.equal(scanObservedFixture({transport:{...transport,pageUrl:'https://www.douyin.com/video/other123'}}).candidates.length,0);
+  assert.equal(scanObservedFixture({transport:{...transport,observedAt:Date.now()+100000}}).candidates.length,0);
+  assert.equal(scanObservedFixture({transport:{...transport,candidates:Array(401).fill(video)}}).candidates.length,0);
+  assert.equal(scanObservedFixture({pageUrl:'https://www.douyin.com/video/owner123?modal_id=other123',transport}).candidates.length,0);
+});
+
+test('current page ID only filters actual SSR owning objects and never labels arbitrary clips', () => {
+  const clip=id=>({aweme_id:id,video:{play_addr:{url_list:[`https://cdn.test/${id}.mp4`]},
+    bit_rate_audio:[{audio_meta:{file_id:'audio-'+id,url_list:{main_url:`https://cdn.test/${id}.m4a`}}}]}});
+  const scripts=[{id:'RENDER_DATA',type:'',textContent:encodeURIComponent(JSON.stringify([clip('owner123'),clip('other123')]))}];
+  const scanned=scanObservedFixture({scripts});
+  assert.equal(scanned.candidates.length,2);
+  assert.ok(scanned.candidates.every(c=>c.awemeId==='owner123'&&c.metadataObservedAt===100&&c.metadataSource==='ssr'));
+  const modal=scanObservedFixture({pageUrl:'https://www.douyin.com/video/owner123?modal_id=other123',scripts});
+  assert.equal(modal.candidates.length,2);assert.ok(modal.candidates.every(c=>c.awemeId==='other123'));
+});
+
+test('SPA cutoffs exclude old SSR/observer metadata without hiding a current DOM player', async () => {
+  const b=browser();const nav={tabId,frameId:0,documentId:doc};
+  b.events.commit({...nav,url:'https://www.douyin.com/video/owner123',timeStamp:50});await b.list();
+  b.events.history({...nav,url:'https://www.douyin.com/video/other123',timeStamp:200});await b.list();
+  const meta={evidence:'douyin-video-object',pairId:'dy-aweme-owner123',awemeId:'owner123',contentId:'owner123'};
+  const video={url:'https://cdn.test/video.mp4',kind:'video',mime:'video/mp4',metadata:true,...meta,metadataObservedAt:100,
+    baseKind:'video',baseMime:'',from:'element'};
+  b.scans=[{frameId:0,documentId:doc,result:{hasBlob:false,candidates:[video,
+    {url:'https://cdn.test/ssr.m4a',kind:'audio',mime:'audio/mp4',from:'page-json',...meta,metadataObservedAt:100},
+    {url:'https://cdn.test/old-observer.m4a',kind:'audio',mime:'audio/mp4',from:'page-observer',...meta,metadataObservedAt:150}]}}];
+  b.restart();
+  let items=(await b.list()).items;
+  assert.deepEqual(items.map(i=>i.url),[video.url]);assert.equal(items[0].awemeId,undefined);assert.equal(items[0].mergeAudioId,undefined);
+  const current={...meta,awemeId:'other123',contentId:'other123',pairId:'dy-aweme-other123',metadataObservedAt:250,from:'page-observer'};
+  b.scans=[{frameId:0,documentId:doc,result:{hasBlob:false,candidates:[
+    {...video,...current}, {url:'https://cdn.test/current.m4a',kind:'audio',mime:'audio/mp4',...current}]}}];
+  items=(await b.list()).items;
+  assert.equal(items.length,2);assert.ok(items.find(i=>i.url===video.url).mergeAudioId);
+});
+
+test('one logical video stays one ordinary item across observed qualities and metadata backups', async () => {
+  const b=browser();
+  const high='https://cdn.test/high.mp4',low='https://cdn.test/current-low.mp4',backup='https://cdn.test/video-backup.mp4';
+  const unseen='https://cdn.test/unplayed-4k.mp4',audio='https://cdn.test/audio.m4a',audioBackup='https://cdn.test/audio-backup.m4a';
+  const other='https://cdn.test/other-owner.mp4';
+  for(const url of [high,low,backup])b.capture('',{url,responseHeaders:headers('video/mp4')});
+  await b.list();
+  const meta={from:'page-json',evidence:'douyin-video-object',pairId:'dy-aweme-owner123',awemeId:'owner123',contentId:'owner123',metadataObservedAt:100};
+  b.dom([{url:low,kind:'video',mime:'video/mp4',from:'element',currentPlayer:true,metadata:true,...meta,from:'element',bitrate:1000000},
+    ...[high,backup,unseen].map(url=>({url,kind:'video',mime:'video/mp4',...meta,bitrate:4000000})),
+    ...[audio,audioBackup].map(url=>({url,kind:'audio',mime:'audio/mp4',...meta,codec:'aac',bitrate:128000,audioGroup:'shared-track123'}))]);
+  let items=(await b.list()).items;
+  const v=items.find(i=>i.kind==='video');
+  assert.equal(v.url,low,'current player wins over unselected high-bitrate rendition');
+  assert.equal(items.filter(i=>i.kind==='video').length,1);
+  assert.equal(items.filter(i=>i.kind==='audio').length,2,'audio filter can still access backups');
+  assert.ok(items.filter(i=>i.kind==='audio').every(i=>i.associatedVideoId===v.id));
+  assert.equal(b.badges.get(tabId),'1');
+  assert.equal(b.stored['media:'+tabId].items.some(i=>i.url===unseen),false,'unplayed metadata video never becomes a list resource');
+  assert.equal(b.stored['media:'+tabId].items.filter(i=>[high,low,backup].includes(i.url)).length,3);
+  // A genuinely separate owner remains a separate logical video.
+  b.capture('',{url:other,responseHeaders:headers('video/mp4')});
+  b.scans[0].result.candidates.push({url:other,kind:'video',mime:'video/mp4',...meta,pairId:'dy-aweme-other123',awemeId:'other123',contentId:'other123'});
+  items=(await b.list()).items;
+  assert.equal(items.filter(i=>i.kind==='video').length,2);
+  assert.equal(b.badges.get(tabId),'2');
 });

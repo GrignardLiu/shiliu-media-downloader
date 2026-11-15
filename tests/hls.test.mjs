@@ -201,3 +201,101 @@ test("download page rolls back a partial response or cancellation and starts fro
   assert.deepEqual(committed, Buffer.concat([ts, ts]));
   assert.deepEqual(pickedNames, Array(3).fill("video - 640 × 360 · 1000 kbps.ts"));
 });
+import {createHlsMp4Finalizer} from "../extension/hls-mp4.js";
+import {spawnSync} from "node:child_process";
+import {mkdir, mkdtemp, readFile, writeFile} from "node:fs/promises";
+import {resolve, join} from "node:path";
+import {fileURLToPath} from "node:url";
+
+function full(type, payload, version = 0) {
+  return box(type, Buffer.from([version, 0, 0, 0]), payload);
+}
+function words(...values) {
+  const data = Buffer.alloc(values.length * 4); values.forEach((value,index) => data.writeUInt32BE(value,index * 4)); return data;
+}
+function timingFixture(version = 0, ids = [1,2], editCount = 0) {
+  const movie = Buffer.alloc(version ? 108 : 96), scaleAt = version ? 16 : 8;
+  movie.writeUInt32BE(1000,scaleAt);
+  const tracks = ids.map(id => {
+    const header = Buffer.alloc(version ? 92 : 80); header.writeUInt32BE(id,version ? 16 : 8);
+    const media = Buffer.alloc(version ? 40 : 28); media.writeUInt32BE(48000,scaleAt);
+    const edits = editCount ? box("edts",full("elst",Buffer.concat([words(editCount),Buffer.alloc(editCount * 12)]))) : Buffer.alloc(0);
+    return box("trak",full("tkhd",header,version),box("mdia",full("mdhd",media,version)),edits);
+  });
+  const init = new Blob([box("ftyp",Buffer.from("iso6\0\0\0\0")),box("moov",full("mvhd",movie,version),...tracks,
+    box("mvex",...ids.map(id => full("trex",words(id,1,1024,4,0)))))]);
+  const fragment = new Blob([box("moof",...ids.map(id => {
+    const tfdt = version ? Buffer.alloc(8) : words(0);
+    return box("traf",full("tfhd",words(id)),full("tfdt",tfdt,version),full("trun",words(id === 1 ? 94 : 96)));
+  })),box("mdat",Buffer.alloc(768))]);
+  return {init,fragment};
+}
+
+test("HLS MP4 duration finalizer supports audio-only/multi-traf and v0/v1 fields, bounds and cancel", async () => {
+  for (const version of [0,1]) for (const ids of [[1],[1,2]]) {
+    const {init,fragment} = timingFixture(version,ids), output = Buffer.concat([Buffer.from(await init.arrayBuffer()),Buffer.from(await fragment.arrayBuffer())]);
+    const original = Buffer.from(output), patches = [];
+    const finalizer = await createHlsMp4Finalizer(init,ok());
+    await finalizer.observe(fragment,ok());
+    const result = await finalizer.finalize({write(operation) { patches.push(operation); Buffer.from(operation.data).copy(output,operation.position); }},ok());
+    assert.equal(result.duration,ids.length === 1 ? 2.006 : 2.048);
+    assert.equal(patches.length,1 + ids.length * 2);
+    const movieAt = output.indexOf(Buffer.from("mvhd")) + (version ? 28 : 20);
+    assert.equal(version ? Number(output.readBigUInt64BE(movieAt)) : output.readUInt32BE(movieAt), Math.round(result.duration * 1000));
+    let trackAt = 0, mediaAt = 0;
+    for (const id of ids) {
+      trackAt = output.indexOf(Buffer.from("tkhd"),trackAt + 1);
+      mediaAt = output.indexOf(Buffer.from("mdhd"),mediaAt + 1);
+      const durationAt = trackAt + (version ? 32 : 24), decodedAt = mediaAt + (version ? 28 : 20), expectedSamples = id === 1 ? 94 : 96;
+      assert.equal(version ? Number(output.readBigUInt64BE(durationAt)) : output.readUInt32BE(durationAt), Math.ceil(expectedSamples * 1024 / 48));
+      assert.equal(version ? Number(output.readBigUInt64BE(decodedAt)) : output.readUInt32BE(decodedAt), expectedSamples * 1024);
+    }
+    assert.ok(patches.every(patch => patch.data.length === (version ? 8 : 4)));
+    assert.deepEqual(output.subarray(init.size),original.subarray(init.size));
+    assert.notDeepEqual(output.subarray(0,init.size),original.subarray(0,init.size));
+    const abort = new AbortController(); abort.abort();
+    await assert.rejects(finalizer.finalize({write() { throw new Error("must not write"); }},abort.signal),{name:"AbortError"});
+  }
+  const {init,fragment} = timingFixture(0,[1]), finalizer = await createHlsMp4Finalizer(init,ok());
+  const malformed = Buffer.from(await fragment.arrayBuffer()), run = malformed.indexOf(Buffer.from("trun"));
+  malformed.writeUInt32BE(10000001,run + 8);
+  await assert.rejects(finalizer.observe(new Blob([malformed]),ok()),/样本时长/);
+  await assert.rejects(createHlsMp4Finalizer(new Blob([box("ftyp")]),ok()),/moov/);
+  await assert.rejects(createHlsMp4Finalizer(timingFixture(0,[1],4097).init,ok()),/条目过多/);
+  await assert.rejects(createHlsMp4Finalizer(init,AbortSignal.abort()),{name:"AbortError"});
+});
+
+const ffmpegAvailable = spawnSync("ffmpeg",["-version"]).status === 0 && spawnSync("ffprobe",["-version"]).status === 0;
+function runMedia(command,args,options = {}) {
+  const result = spawnSync(command,args,{encoding:"utf8",windowsHide:true,maxBuffer:4 * 1024 ** 2,...options});
+  assert.equal(result.status,0,result.stderr || result.error?.message); return result.stdout;
+}
+test("8-second multi-track HLS fMP4 preserves all packet timestamps/hashes and exposes native duration/seek", {skip:!ffmpegAvailable,timeout:30000}, async () => {
+  await mkdir(resolve("work"),{recursive:true}); const dir = await mkdtemp(join(resolve("work"),"hls-finalize-"));
+  const playlistPath = join(dir,"track.m3u8");
+  runMedia("ffmpeg",["-nostdin","-v","error","-f","lavfi","-i","testsrc2=size=96x64:rate=12:duration=8","-f","lavfi","-i","sine=frequency=440:sample_rate=48000:duration=8",
+    "-c:v","libx264","-pix_fmt","yuv420p","-preset","ultrafast","-g","12","-sc_threshold","0","-c:a","aac","-b:a","32k","-f","hls","-hls_time","1","-hls_playlist_type","vod","-hls_segment_type","fmp4",
+    "-hls_fmp4_init_filename","init.mp4","-hls_segment_filename","seg-%d.m4s","-y","track.m3u8"],{cwd:dir});
+  const playlist = parsePlaylist(await readFile(playlistPath,"utf8"),"https://example.test/track.m3u8");
+  const init = new Blob([await readFile(join(dir,"init.mp4"))]), parts = [Buffer.from(await init.arrayBuffer())];
+  const finalizer = await createHlsMp4Finalizer(init,ok());
+  for (const segment of playlist.segments) {
+    const data = await readFile(join(dir,new URL(segment.url).pathname.slice(1)));
+    const checked = await checkSegment(new Blob([data]),"fragment",false,ok());
+    await finalizer.observe(checked.blob,ok()); parts.push(data);
+  }
+  const raw = Buffer.concat(parts), finalized = Buffer.from(raw), rawPath = join(dir,"raw.mp4"), finalizedPath = join(dir,"finalized.mp4");
+  const result = await finalizer.finalize({write(operation) { Buffer.from(operation.data).copy(finalized,operation.position); }},ok());
+  assert.ok(result.duration >= 8 && result.duration < 8.1);
+  assert.deepEqual(finalized.subarray(init.size),raw.subarray(init.size));
+  await writeFile(rawPath,raw); await writeFile(finalizedPath,finalized);
+  const packets = file => JSON.parse(runMedia("ffprobe",["-v","error","-show_packets","-show_data_hash","sha256","-of","json",file])).packets.map(packet => [packet.stream_index,packet.pts_time,packet.dts_time,packet.duration_time,packet.data_hash]);
+  assert.deepEqual(packets(finalizedPath),packets(rawPath));
+  runMedia("ffmpeg",["-nostdin","-v","error","-xerror","-i",finalizedPath,"-f","null","-"]);
+  if (process.platform === "win32") {
+    const report = JSON.parse(runMedia("powershell",["-NoProfile","-ExecutionPolicy","Bypass","-File",fileURLToPath(new URL("./native-playback.ps1",import.meta.url)),finalizedPath]));
+    assert.equal(report[0].Ok,true);assert.ok(report[0].Video.Duration >= 8);assert.equal(report[0].Video.SeekChecked,true);assert.equal(report[0].Audio.SeekChecked,true);
+  }
+});
+
+

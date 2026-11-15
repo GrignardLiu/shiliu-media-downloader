@@ -47,6 +47,8 @@ async function popup({items, hasBlob = false} = {}) {
     rows() { return elements.list.children.map(row => row.dataset.item); },
     blobNote: elements['blob-note'],
     action(i) { return elements.list.children[i].querySelector('.action'); },
+    original(i) { return elements.list.children[i].querySelector('.original-action'); },
+    manual(i) { return elements.list.children[i].querySelector('.merge-action'); },
     note(i) { return elements.list.children[i].querySelector('.transfer-status'); },
     filter(i) { elements.filters.handlers.click({target: elements.filters.children[i]}); },
   };
@@ -91,13 +93,38 @@ test('a paired video opens merge once while original video and audio remain down
     {id:'audio',kind:'audio',name:'a.m4a',extension:'m4a',url:'https://cdn.test/a.m4a'},
   ]});
   assert.deepEqual(ui.rows(), ['video']);
-  assert.equal(ui.action(0).querySelector('span').textContent, '合并下载');
+  assert.equal(ui.action(0).querySelector('span').textContent, '下载视频');
+  assert.equal(ui.manual(0).hidden, true);
   await ui.action(0).handlers.click();
-  assert.deepEqual(ui.opened, ['chrome-extension://test/merge.html#tab=7&item=video&audio=audio']);
+  assert.deepEqual(ui.opened, ['chrome-extension://test/merge.html#tab=7&item=video&mode=auto&audio=audio']);
+  await ui.original(0).handlers.click();
+  assert.deepEqual(ui.ids, [12]);
   ui.filter(1);
   assert.deepEqual(ui.rows(), ['audio']);
   await ui.action(0).handlers.click();
-  assert.deepEqual(ui.ids, [12]);
+  assert.deepEqual(ui.ids, [12, 12]);
+});
+
+test('an MP4 with unknown audio tracks always enters automatic inspection without manual selection', async () => {
+  const ui = await popup({items: [{id:'unknown',kind:'video',name:'video.mp4',extension:'mp4',url:'https://cdn.test/video.mp4'}]});
+  assert.equal(ui.action(0).querySelector('span').textContent, '下载视频');
+  assert.equal(ui.manual(0).hidden, true);
+  await ui.action(0).handlers.click();
+  assert.deepEqual(ui.opened, ['chrome-extension://test/merge.html#tab=7&item=unknown&mode=auto']);
+  assert.deepEqual(ui.ids, []);
+  assert.match(ui.note(0).textContent, /自动检查/);
+});
+
+test('alternate soundtracks stay under the video in the default view and remain available in the audio filter', async () => {
+  const ui = await popup({items: [
+    {id:'video',kind:'video',url:'https://cdn.test/v.mp4',name:'v.mp4',mergeAudioId:'audio'},
+    {id:'audio',kind:'audio',url:'https://cdn.test/a.m4a',associatedVideoId:'video'},
+    {id:'backup',kind:'audio',url:'https://cdn.test/backup.m4a',associatedVideoId:'video'},
+    {id:'other',kind:'audio',url:'https://cdn.test/unrelated.mp3'},
+  ]});
+  assert.deepEqual(ui.rows(), ['video','other']);
+  ui.filter(1);
+  assert.deepEqual(ui.rows(), ['audio','backup','other']);
 });
 
 test('completion before the ID arrives is read back, with a sign-in page reported separately from valid media', async () => {

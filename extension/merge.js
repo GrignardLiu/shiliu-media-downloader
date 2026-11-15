@@ -2,17 +2,22 @@ import './media-pairing.js';
 import {streamFile} from './file-core.js';
 import {fetchMedia} from './media-request.js';
 import {inspectMp4, mergeMp4} from './mp4-merge.js';
+import {automaticVideo, validatePair} from './auto-download.js';
 
 const el = Object.fromEntries([...document.querySelectorAll('[id]')].map(node => [node.id, node]));
 const params = new URLSearchParams(location.hash.slice(1));
 const tabId = Number(params.get('tab'));
+const automatic = params.get('mode') === 'auto';
+if (automatic) el.tracks.hidden = true;
 let items = [];
+let anchor;
 let controller;
 const status = (message, error = false) => {
   el.status.textContent = message;
   el.status.classList.toggle('error', error);
 };
 function update() {
+  if (automatic) { el.start.disabled = Boolean(controller) || !anchor; return; }
   const video = el['video-track'].value;
   const audio = el['audio-track'].value;
   el.start.disabled = Boolean(controller) || !video || !audio || video === audio;
@@ -66,7 +71,7 @@ async function receive(id, directory, name, label, signal) {
 
 async function download() {
   if (controller || el.start.disabled) return;
-  const videoId = el['video-track'].value;
+  const videoId = automatic ? anchor.id : el['video-track'].value;
   const audioId = el['audio-track'].value;
   const selected = items.find(item => item.id === videoId);
   controller = new AbortController();
@@ -75,7 +80,7 @@ async function download() {
   el['video-track'].disabled = el['audio-track'].disabled = true;
   let root, directoryName, writable, handle;
   try {
-    const suggestedName = (selected.name || '视频').replace(/\.[^.]+$/, '') + '-有声.mp4';
+    const suggestedName = (selected.name || '视频').replace(/\.[^.]+$/, '') + (automatic ? '' : '-有声') + '.mp4';
     handle = await window.showSaveFilePicker({id: 'merged-media-export', startIn: 'downloads', suggestedName,
       types: [{description: 'MP4 视频', accept: {'video/mp4': ['.mp4']}}]});
     el.cancel.hidden = false;
@@ -85,6 +90,19 @@ async function download() {
     root = await navigator.storage.getDirectory();
     directoryName = 'shiliu-merge-' + crypto.randomUUID();
     const directory = await root.getDirectoryHandle(directoryName, {create: true});
+    let merged, didMerge = false;
+    if (automatic) {
+      const result = await automaticVideo({videoId, signal,
+        receive: (id, label) => receive(id, directory, id === videoId ? 'video.mp4' : 'audio.mp4', label, signal),
+        inspect: inspectMp4,
+        pair: id => chrome.runtime.sendMessage({type: 'GET_AUTO_PAIR', tabId, id}),
+        merge: mergeMp4,
+        onStage(stage) {
+          const messages = {inspect: '正在检查视频是否包含声音…', pair: '正在识别对应音轨…', merge: '正在无损合并画面与声音…'};
+          if (messages[stage]) { status(messages[stage]); el.bar.removeAttribute('value'); }
+        }});
+      merged = result.file; didMerge = result.merged;
+    } else {
     let video = await receive(videoId, directory, 'video.mp4', '正在下载画面来源', signal);
     let audio = await receive(audioId, directory, 'audio.mp4', '正在下载声音来源', signal);
     status('正在检查实际视频和音频轨道…');
@@ -95,32 +113,26 @@ async function download() {
       [video, audio] = [audio, video];
       [videoInfo, audioInfo] = [audioInfo, videoInfo];
     }
-    if (!only(videoInfo, 'video') || !only(audioInfo, 'audio')) {
-      throw new Error('需要一个独立视频轨和一个独立音轨。所选文件已包含声音，或不是对应的单轨文件，请重新选择。');
-    }
-    const duration = info => info.tracks[0].duration || info.duration;
-    const difference = Math.abs(duration(videoInfo) - duration(audioInfo));
-    if (difference > Math.max(2, Math.min(5, duration(videoInfo) * 0.01))) {
-      throw new Error('两个文件的时长差异较大，可能来自不同视频，请重新选择对应音轨。');
-    }
+    validatePair(videoInfo, audioInfo);
     status('正在无损合并画面与声音…');
     el.bar.removeAttribute('value');
-    const merged = await mergeMp4(video, audio, {signal});
+    merged = await mergeMp4(video, audio, {signal}); didMerge = true;
+    }
     signal.throwIfAborted();
     writable = await handle.createWritable({mode: 'exclusive'});
-    status('正在保存合并后的 MP4…');
+    status('正在保存 MP4…');
     await merged.stream().pipeTo(writable, {signal, preventClose: true, preventAbort: true});
     signal.throwIfAborted();
     await writable.close();
     writable = null;
-    status('已保存「' + handle.name + '」，包含画面和声音。');
+    status('已保存「' + handle.name + '」，' + (didMerge ? '已自动合并画面和声音。' : '原视频已包含声音。'));
   } catch (error) {
     if (writable) await writable.abort().catch(() => {});
     const canceled = signal.aborted || (!handle && error.name === 'AbortError');
     const message = error.name === 'QuotaExceededError' ? '浏览器临时存储空间不足，请释放磁盘空间后重试。'
       : error instanceof TypeError ? '媒体连接中断，请在原网页重新播放并扫描最新地址。'
       : error.message || '合并失败，请重新选择资源。';
-    status(canceled ? '已取消合并下载。' : message, !canceled);
+    status(canceled ? (automatic ? '已取消下载。' : '已取消合并下载。') : message, !canceled);
   } finally {
     if (root && directoryName) await root.removeEntry(directoryName, {recursive: true}).catch(() => {});
     controller = null;
@@ -143,8 +155,17 @@ async function initialize() {
     const result = await chrome.runtime.sendMessage({type: 'LIST_MEDIA', tabId});
     if (!result?.ok) throw new Error(result?.error || '无法读取资源列表。');
     items = result.items.filter(item => ShiliuPairing.isMp4(item));
-    const anchor = items.find(item => item.id === params.get('item'));
+    anchor = items.find(item => item.id === params.get('item'));
     if (!anchor) throw new Error('原网页已更新，请重新扫描。');
+    if (automatic) {
+      el.tracks.hidden = true;
+      el.heading.textContent = '下载视频';
+      el['source-heading'].textContent = anchor.name || '视频';
+      el.site.textContent = '自动检查实际声音，必要时合并对应音轨，保留原始画质。';
+      el.start.textContent = '选择位置并下载';
+      el['save-hint'].textContent = '下载时请保持此页打开。临时文件在完成或取消后清理。';
+      update(); status('选择保存位置后，将自动检查并保存有声视频。'); return;
+    }
     const anchorAudio = ShiliuPairing.classify(anchor).track === 'audio';
     options(el['video-track'], anchorAudio ? '' : anchor.id);
     options(el['audio-track'], anchorAudio ? anchor.id : anchor.mergeAudioId);

@@ -22,6 +22,11 @@ const mediaMime = /^(?:audio|video)\/|mpegurl|dash\+xml|^application\/ogg$/;
 const trackFragmentName = /^(?:init|seg(?:ment)?|chunk|frag(?:ment)?)(?:[-_.]\d+)*[-_.][va]\d+(?:[-_.][va]?\d+)*\.(?:mp4|m4a|aac)$/i;
 const pending = new Map();
 const requests = new Map();
+// Persist only opaque request IDs and start times until completion, so a
+// redirected request cannot acquire a new start after service-worker restart.
+const requestStarts = new Map();
+const requestTabs = new Map();
+
 const probes = new Map();
 const probeAccept = 'application/vnd.apple.mpegurl, application/x-mpegurl;q=0.9, */*;q=0.5';
 const probeScope = (tabId, documentId, url) => JSON.stringify([tabId, documentId, url]);
@@ -82,9 +87,8 @@ async function saveState(tabId, state) {
     }
     if (!saved) throw error;
   }
-  const uniqueItems = [...new Map(state.items.map(item => [item.url, item])).values()];
-  const count = uniqueItems.length - ShiliuPairing.findPairs(uniqueItems)
-    .filter(pair => ShiliuPairing.isMp4(pair.video) && ShiliuPairing.isMp4(pair.audio)).length;
+  const visible = presentMedia(state.items);
+  const count = visible.items.length - visible.associated.size;
   await chrome.action.setBadgeText({tabId, text: count ? String(count) : ''}).catch(() => {});
 }
 
@@ -186,6 +190,16 @@ function upsert(state, item, frameId, documentId, source, size = null, rank = 2)
         update.name = safeName(item.name, update.extension, update.kind);
       }
     }
+    for (const key of ['pairId','contentId','videoId','awemeId','audioGroup','evidence','codec','bitrate','metadataTrack','currentPlayer','domPresent']) {
+      if (item[key] === undefined) continue;
+      if (['pairId','contentId','videoId','awemeId'].includes(key) && existing[key] && existing[key] !== item[key]) update.associationConflict = true;
+      update[key] = item[key];
+    }
+    if (item.associationConflict) update.associationConflict = true;
+    if ((update.metadataTrack || existing.metadataTrack) === 'audio' && (update.evidence || existing.evidence) === 'douyin-video-object') {
+      update.kind = 'audio'; if ((update.extension || existing.extension) === 'mp4') update.extension = 'm4a';
+      update.name = safeName(update.name || existing.name, update.extension || existing.extension, 'audio');
+    }
     if (item.playlistSeenAt) update.playlistSeenAt = Math.max(item.playlistSeenAt, existing.playlistSeenAt || 0);
     if (Object.keys(update).every(key => existing[key] === update[key])) return false;
     Object.assign(existing, update);
@@ -228,6 +242,41 @@ function httpOrigin(value) {
   } catch { return ''; }
 }
 
+const requestStartKey = requestId => 'request-start:' + requestId;
+function requestStart(requestId) {
+  return requestStarts.get(requestId) || chrome.storage.session.get(requestStartKey(requestId))
+    .then(value => value[requestStartKey(requestId)]?.timeStamp).catch(() => NaN);
+}
+function finishRequest(requestId) {
+  const started = requestStarts.get(requestId);
+  requestStarts.delete(requestId);
+  requestTabs.delete(requestId);
+  requests.delete(requestId);
+  // A fast response may complete while the initial session write is pending.
+  Promise.resolve(started).catch(() => {}).then(() =>
+    chrome.storage.session.remove(requestStartKey(requestId))).catch(console.warn);
+}
+chrome.webRequest.onBeforeRequest.addListener(details => {
+  if (details.tabId < 0 || details.method !== 'GET') return;
+  // Redirects retain the request ID. Read any start persisted by a prior worker.
+  if (!requestStarts.has(details.requestId)) {
+    if (requestStarts.size >= 2048) {
+      const oldest = requestStarts.keys().next().value;
+      requestStarts.delete(oldest); requestTabs.delete(oldest);
+    }
+    const key = requestStartKey(details.requestId);
+    const started = chrome.storage.session.get(key).then(async value => {
+      if (value[key]?.tabId === details.tabId && Number.isFinite(value[key].timeStamp)) return value[key].timeStamp;
+      if (!Number.isFinite(details.timeStamp)) return NaN;
+      await chrome.storage.session.set({[key]: {tabId: details.tabId, frameId: details.frameId, timeStamp: details.timeStamp}});
+      return details.timeStamp;
+    }).catch(() => NaN); // Missing proof must never bypass a SPA cutoff.
+    requestTabs.set(details.requestId, details.tabId);
+    requestStarts.set(details.requestId, started);
+  }
+}, mediaRequests);
+chrome.webRequest.onCompleted.addListener(({requestId}) => finishRequest(requestId), mediaRequests);
+
 chrome.webRequest.onSendHeaders.addListener(details => {
   const {requestId, tabId, method, requestHeaders, initiator} = details;
   requests.delete(requestId); // Redirects can keep the ID and send different headers.
@@ -263,11 +312,12 @@ chrome.webRequest.onSendHeaders.addListener(details => {
   requests.set(requestId, observed);
 }, mediaRequests, ['requestHeaders', 'extraHeaders']);
 
-chrome.webRequest.onErrorOccurred.addListener(({requestId}) => requests.delete(requestId), mediaRequests);
+chrome.webRequest.onErrorOccurred.addListener(({requestId}) => finishRequest(requestId), mediaRequests);
 
 chrome.webRequest.onHeadersReceived.addListener(details => {
   const {tabId, frameId, documentId, method, statusCode, type} = details;
   const observed = requests.get(details.requestId);
+  const start = requestStart(details.requestId);
   requests.delete(details.requestId);
   if (observed?.probe) {
     const ok = observed.trusted && observed.probe.scope === probeScope(tabId, documentId, details.url) &&
@@ -301,6 +351,11 @@ chrome.webRequest.onHeadersReceived.addListener(details => {
       if (!frame || (frame.documentId && frame.documentId !== documentId)) return;
     }
     const state = await readState(tabId);
+    if (!['main_frame','sub_frame'].includes(type)) {
+      const boundary = frameRouteSince(state, frameId, documentId);
+      const startedAt = boundary ? await start : 0;
+      if (boundary && (!Number.isFinite(startedAt) || startedAt < boundary)) return;
+    }
     if (upsert(state, item, frameId, documentId || '', 'network', headerSize(headers, statusCode))) {
       await saveState(tabId, state);
     }
@@ -312,6 +367,12 @@ function route(url) {
   // Hash-router URLs represent distinct SPA pages; ordinary section anchors do not.
   const hash = url.indexOf('#');
   return hash < 0 || /^#!?\//.test(url.slice(hash)) ? url : url.slice(0, hash);
+}
+
+function frameRouteSince(state, frameId, documentId) {
+  const frame = state.frameRoutes?.[frameId];
+  return Math.max(state.since || 0,
+    frame && (!documentId || !frame.documentId || frame.documentId === documentId) ? frame.since || 0 : 0);
 }
 
 // Only retain an opaque comparison key for SPA navigation, never the browsing URL.
@@ -328,7 +389,6 @@ chrome.webNavigation.onCommitted.addListener(event => {
     const state = await readState(event.tabId);
     const main = event.frameId === 0;
     const url = route(event.url);
-    const previousCount = state.items.length;
     state.items = state.items.filter(item => {
       if (!main && item.frameId !== event.frameId) return true;
       if (item.documentId && item.documentId === event.documentId) return true;
@@ -342,20 +402,37 @@ chrome.webNavigation.onCommitted.addListener(event => {
     if (main) {
       state.route = await routeKey(url);
       state.since = 0;
+      state.frameRoutes = {};
     }
-    if (main || previousCount) await saveState(event.tabId, state);
+    state.frameRoutes ||= {};
+    state.frameRoutes[event.frameId] = {key: await routeKey(url), documentId: event.documentId || '',
+      since: 0, timeStamp: event.timeStamp || 0};
+    await saveState(event.tabId, state);
   }).catch(console.warn);
 });
 
 function updateRoute(event) {
-  if (event.frameId !== 0 || event.tabId < 0) return;
+  if (event.tabId < 0) return;
   inOrder(event.tabId, async () => {
+    const frame = await chrome.webNavigation.getFrame({tabId: event.tabId, frameId: event.frameId}).catch(() => null);
+    if (!frame || (event.documentId && frame.documentId && event.documentId !== frame.documentId)) return;
     const state = await readState(event.tabId);
+    state.frameRoutes ||= {};
+    const previous = state.frameRoutes[event.frameId];
+    // Ignore an event delivered out of order within the same document.
+    if (previous?.documentId === (event.documentId || '') && event.timeStamp < previous.timeStamp) return;
     const key = await routeKey(route(event.url));
-    if (key !== state.route) {
-      state.route = key;
-      state.since = event.timeStamp;
-      state.items = [];
+    const main = event.frameId === 0;
+    if (key !== (previous?.key ?? (main ? state.route : ''))) {
+      state.frameRoutes[event.frameId] = {key, documentId: event.documentId || '',
+        since: event.timeStamp, timeStamp: event.timeStamp};
+      if (main) {
+        state.route = key;
+        state.since = event.timeStamp;
+        state.items = [];
+      } else {
+        state.items = state.items.filter(item => item.frameId !== event.frameId);
+      }
       await saveState(event.tabId, state);
     }
   }).catch(console.warn);
@@ -363,9 +440,23 @@ function updateRoute(event) {
 chrome.webNavigation.onHistoryStateUpdated.addListener(updateRoute);
 chrome.webNavigation.onReferenceFragmentUpdated.addListener(updateRoute);
 
+async function clearRequestStarts(tabId) {
+  const jobs = [];
+  for (const [requestId, owner] of requestTabs) {
+    if (owner !== tabId) continue;
+    jobs.push(requestStarts.get(requestId));
+    requestStarts.delete(requestId); requestTabs.delete(requestId); requests.delete(requestId);
+  }
+  await Promise.allSettled(jobs);
+  const all = await chrome.storage.session.get(null);
+  const keys = Object.keys(all).filter(key => key.startsWith('request-start:') && all[key]?.tabId === tabId);
+  if (keys.length) await chrome.storage.session.remove(keys);
+}
+
 chrome.tabs.onRemoved.addListener(tabId => {
   inOrder(tabId, async () => {
     await clearDownloadRule(tabId);
+    await clearRequestStarts(tabId);
     await chrome.storage.session.remove(keyFor(tabId));
   }).catch(console.warn);
 });
@@ -373,10 +464,60 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.action.setBadgeBackgroundColor({color: '#0F766E'});
 });
 
+// Choose whole same-document pairs before collapsing duplicate URLs. A later
+// iframe copy must never replace one half of an already usable player pair.
+function presentMedia(items) {
+  // Present one logical clip per proven owner in a document, retaining every
+  // observed rendition internally for source-specific automatic downloads.
+  const representatives = new Map(), grouped = new Set();
+  const priority = item => [item.currentPlayer ? 1 : 0, item.domPresent ? 3 : Math.min(item.rank || 0, 2),
+    Number.isFinite(item.bitrate) ? item.bitrate : 0];
+  const better = (a,b) => { const x=priority(a),y=priority(b); for(let n=0;n<x.length;n++) if(x[n]!==y[n])return x[n]>y[n];return false; };
+  for (const item of items) {
+    const parsed = ShiliuPairing.classify(item);
+    if (parsed.track !== 'video' || parsed.conflicted || !ShiliuPairing.isMp4(item)) continue;
+    const owner = item.evidence === 'douyin-video-object' && item.pairId && item.awemeId
+      ? 'owner:' + item.pairId + ':' + item.awemeId
+      : parsed.identities.find(id=>id.startsWith('aweme:')) || parsed.identities.find(id=>id.startsWith('video:'));
+    if (!owner) continue;
+    const key = JSON.stringify([item.frameId,item.documentId,owner]);
+    grouped.add(item.id);
+    if (!representatives.has(key) || better(item,representatives.get(key))) representatives.set(key,item);
+  }
+  const representativeIds = new Set([...representatives.values()].map(item=>item.id));
+  const logical = items.filter(item=>!grouped.has(item.id)||representativeIds.has(item.id));
+  const chosen = new Map(), pairs = new Map(), pairedUrls = new Set(), signatures = new Set();
+  for (const pair of ShiliuPairing.findPairs(logical)) {
+    if (!ShiliuPairing.isMp4(pair.video) || !ShiliuPairing.isMp4(pair.audio)) continue;
+    const signature = JSON.stringify([pair.video.url, pair.audio.url]);
+    if (signatures.has(signature)) continue;
+    signatures.add(signature);
+    chosen.set(pair.video.id, pair.video);
+    chosen.set(pair.audio.id, pair.audio);
+    pairedUrls.add(pair.video.url); pairedUrls.add(pair.audio.url);
+    pairs.set(pair.video.id, pair.audio.id);
+  }
+  const unmatched = new Map();
+  for (const item of logical) {
+    if (!pairedUrls.has(item.url) && (!unmatched.has(item.url) || item.source === 'network')) {
+      unmatched.set(item.url, item);
+    }
+  }
+  for (const item of unmatched.values()) chosen.set(item.id, item);
+  // Keep stable catalogue order, including necessary duplicate video rows only
+  // when they belong to distinct complete audio/video pairs.
+  const visible = items.filter(item => chosen.has(item.id)), associated = new Map();
+  for (const audio of visible.filter(item=>ShiliuPairing.classify(item).track==='audio')) {
+    const video=visible.find(item=>ShiliuPairing.findAudio([item,audio],item).audio===audio);
+    if(video)associated.set(audio.id,video.id);
+  }
+  return {items: visible, pairs, associated};
+}
+
 async function listMedia(tabId) {
   return inOrder(tabId, async () => {
     const scanFrames = allFrames => chrome.scripting.executeScript({
-      target: {tabId, allFrames}, files: ['content.js'], injectImmediately: true,
+      target: {tabId, allFrames}, files: ['page-media.js', 'content.js'], injectImmediately: true,
     });
     // A restricted child frame should not prevent scanning the top document.
     const scans = await scanFrames(true).catch(() => scanFrames(false).catch(() => []));
@@ -386,6 +527,14 @@ async function listMedia(tabId) {
       (!row.documentId || !live.get(row.frameId) || live.get(row.frameId) === row.documentId));
     const state = await readState(tabId);
     const oldCount = state.items.length;
+    let routesPruned = false;
+    if (live && state.frameRoutes) {
+      for (const [id, saved] of Object.entries(state.frameRoutes)) {
+        if (!live.has(Number(id)) || (saved.documentId && live.get(Number(id)) && saved.documentId !== live.get(Number(id)))) {
+          delete state.frameRoutes[id]; routesPruned = true;
+        }
+      }
+    }
     const observed = new Map();
     const found = [];
     let hasBlob = false;
@@ -395,32 +544,50 @@ async function listMedia(tabId) {
       const urls = new Set();
       observed.set(scan.frameId, urls);
       for (const candidate of scan.result.candidates) {
-        if (candidate.from === 'timing' && candidate.time < state.since) continue;
-        const item = describe(candidate.url, candidate.mime, '', candidate.kind, candidate.from);
+        if (candidate.from === 'timing' && candidate.time < frameRouteSince(state, scan.frameId, scan.documentId)) continue;
+        const cutoff = frameRouteSince(state, scan.frameId, scan.documentId);
+        const metadataFresh = !cutoff || Number.isFinite(candidate.metadataObservedAt) && candidate.metadataObservedAt >= cutoff;
+        if (['page-json','page-observer'].includes(candidate.from) && !metadataFresh) continue;
+        const item = describe(candidate.url, metadataFresh ? candidate.mime : candidate.baseMime ?? candidate.mime, '',
+          metadataFresh ? candidate.kind : candidate.baseKind ?? candidate.kind, candidate.from);
         if (!item) continue;
+        // Metadata may enrich a captured rendition, but must not advertise all
+        // server-side quality/backup video URLs as new playable list entries.
+        if (['page-json','page-observer'].includes(candidate.from) && item.kind === 'video' &&
+            !state.items.some(row=>row.url===item.url&&row.frameId===scan.frameId&&row.documentId===(scan.documentId||''))) continue;
+        item.currentPlayer = candidate.currentPlayer === true;
+        item.domPresent = candidate.from === 'element';
+        if (metadataFresh && (['page-json','page-observer'].includes(candidate.from) || candidate.metadata === true) && candidate.evidence === 'douyin-video-object') {
+          for (const key of ['pairId','contentId','videoId','awemeId','audioGroup']) {
+            if (typeof candidate[key] === 'string' && /^[\w.-]{3,160}$/.test(candidate[key])) item[key] = candidate[key];
+          }
+          item.evidence = candidate.evidence;
+          if (['audio','video'].includes(candidate.metadataTrack || candidate.kind)) item.metadataTrack = candidate.metadataTrack || candidate.kind;
+          if (item.metadataTrack === 'audio') { item.kind = 'audio'; if (item.extension === 'mp4') item.extension = 'm4a'; item.name = safeName(item.name,item.extension,item.kind); }
+          if (typeof candidate.codec === 'string') item.codec = candidate.codec.slice(0,64);
+          if (Number.isFinite(candidate.bitrate) && candidate.bitrate > 0 && candidate.bitrate < 1e10) item.bitrate = candidate.bitrate;
+          if (candidate.associationConflict) item.associationConflict = true;
+        }
         if (item.kind === 'hls' && candidate.from === 'timing') item.playlistSeenAt = candidate.time;
         urls.add(item.url);
-        const rank = {element: 3, timing: 1, link: 0}[candidate.from];
+        const rank = {element: 3, 'page-json': 2, 'page-observer': 2, timing: 1, link: 0}[candidate.from];
         found.push({item, frameId: scan.frameId, documentId: scan.documentId || '', rank});
       }
     }
+    const playerFlagsChanged = state.items.some(item=>item.currentPlayer||item.domPresent);
+    for(const item of state.items){ item.currentPlayer=false; item.domPresent=false; }
     state.items = state.items.filter(item => isLive(item) && (item.source === 'network' ||
       !observed.has(item.frameId) || observed.get(item.frameId).has(item.url)));
-    let changed = state.items.length !== oldCount;
+    let changed = routesPruned || playerFlagsChanged || state.items.length !== oldCount;
     for (const {item, frameId, documentId, rank} of found) {
       if (upsert(state, item, frameId, documentId, 'page', null, rank)) changed = true;
     }
     if (changed) await saveState(tabId, state);
-    const unique = new Map();
-    for (const item of state.items) {
-      if (!unique.has(item.url) || item.source === 'network') unique.set(item.url, item);
-    }
-    const pairs = new Map(ShiliuPairing.findPairs([...unique.values()])
-      .filter(pair => ShiliuPairing.isMp4(pair.video) && ShiliuPairing.isMp4(pair.audio))
-      .map(pair => [pair.video.id, pair.audio.id]));
+    const visible = presentMedia(state.items);
     return {ok: true, hasBlob, scanBlocked: !scans.some(scan => scan.result),
-      items: [...unique.values()].map(({frameId, documentId, named, rank, referrer, requestOrigin, playlistSeenAt,
-        hadCookies, ...item}) => ({...item, ...(pairs.has(item.id) ? {mergeAudioId: pairs.get(item.id)} : {})}))};
+      items: visible.items.map(({frameId, documentId, named, rank, referrer, requestOrigin, playlistSeenAt,
+        hadCookies, ...item}) => ({...item, ...(visible.pairs.has(item.id) ? {mergeAudioId: visible.pairs.get(item.id)} : {}),
+          ...(visible.associated.has(item.id) ? {associatedVideoId:visible.associated.get(item.id)} : {})}))};
   });
 }
 
@@ -433,6 +600,22 @@ async function getMedia(tabId, id) {
     throw new Error('页面已更新，请刷新资源列表。');
   }
   return {item, items: state.items, frame};
+}
+
+async function autoPair(tabId, id, sender) {
+  const url = new URL(sender.url), target = new URLSearchParams(url.hash.slice(1));
+  if (url.href.split('#')[0] !== chrome.runtime.getURL('merge.html') || sender.frameId !== 0 ||
+      !Number.isInteger(sender.tab?.id) || target.get('mode') !== 'auto' || target.get('tab') !== String(tabId) ||
+      target.get('item') !== id || !await isCurrentDownloadPage(sender)) {
+    throw new Error('请从拾流打开对应的自动下载页。');
+  }
+  await listMedia(tabId);
+  const {item, items} = await getMedia(tabId, id);
+  if (!ShiliuPairing.isMp4(item) || ShiliuPairing.classify(item).track !== 'video') throw new Error('所选资源不是可自动处理的 MP4 视频。');
+  const selected = ShiliuPairing.findAudio(items, item);
+  if (selected.audio) await getMedia(tabId, selected.audio.id);
+  if (!await isCurrentDownloadPage(sender)) throw new Error('下载页已关闭或更新，请重新打开。');
+  return {ok: true, audioId: selected.audio?.id || null, reason: selected.reason};
 }
 
 function playlistAlternatives(master, items) {
@@ -572,6 +755,10 @@ async function prepareMedia(tabId, id, sender, forMerge = false) {
         item.frameId !== anchor.frameId || item.documentId !== anchor.documentId) {
       throw new Error('请选择同一播放器页面中的 MP4 视频和音频。');
     }
+    if (target.get('mode') === 'auto' && item.id !== anchor.id &&
+        ShiliuPairing.findAudio(items, anchor).audio?.id !== item.id) {
+      throw new Error('尚未发现可可靠关联的音轨，请在原网页播放目标视频后重新扫描。');
+    }
   }
   const origin = httpOrigin(item.url);
   let context = {referrer, requestOrigin};
@@ -634,6 +821,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (message.type === 'LIST_MEDIA') response = listMedia(message.tabId);
   else if (message.type === 'GET_MEDIA') {
     response = prepareMedia(message.tabId, message.id, sender);
+  } else if (message.type === 'GET_AUTO_PAIR') {
+    response = autoPair(message.tabId, message.id, sender);
   } else if (message.type === 'GET_MERGE_MEDIA') {
     response = prepareMedia(message.tabId, message.id, sender, true);
   } else if (message.type === 'DOWNLOAD_MEDIA') response = downloadMedia(message.tabId, message.id);

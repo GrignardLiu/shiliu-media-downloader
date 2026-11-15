@@ -1,5 +1,6 @@
 // node tests/browser-merge.mjs <desktop Chrome or Edge executable>; requires ffmpeg and ffprobe on PATH.
 // Optional --fragment-video and --ordinary-audio exercise alternate MP4 layouts.
+// --page-json requires association from embedded per-clip JSON, with no URL vid.
 // Uses only ephemeral profiles, loopback servers, and the browser's private CDP pipe.
 import assert from "node:assert/strict";
 import {execFileSync, spawn} from "node:child_process";
@@ -12,6 +13,9 @@ import {setTimeout as delay} from "node:timers/promises";
 import {fileURLToPath} from "node:url";
 
 const executable = process.argv[2];
+const pageJson = process.argv.includes('--page-json');
+const pageObserver = process.argv.includes('--page-observer');
+const pageMetadata = pageJson || pageObserver;
 if (!executable) throw new Error("Pass the path to a Chrome or Edge executable.");
 const extension = fileURLToPath(new URL("../extension", import.meta.url));
 const temp = await realpath(tmpdir());
@@ -72,17 +76,29 @@ try {
   await mkdir(fixtureDir);
   const videoFile = path.join(fixtureDir, 'video.mp4');
   const audioFile = path.join(fixtureDir, 'audio.mp4');
+  const completeFile = path.join(fixtureDir, 'complete.mp4');
   execFileSync('ffmpeg', ['-nostdin','-v','error','-f','lavfi','-i','testsrc2=size=96x64:rate=12:duration=2',
     '-an','-c:v','libx264','-pix_fmt','yuv420p','-preset','ultrafast',...(process.argv.includes('--fragment-video')?['-movflags','+frag_keyframe+empty_moov+default_base_moof']:[]),videoFile], {windowsHide:true});
   execFileSync('ffmpeg', ['-nostdin','-v','error','-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=2',
     '-vn','-c:a','aac','-b:a','32k',...(process.argv.includes('--ordinary-audio')?[]:['-movflags','+frag_keyframe+empty_moov+default_base_moof']),audioFile], {windowsHide:true});
   const video = await readFile(videoFile), audio = await readFile(audioFile);
+  execFileSync('ffmpeg',['-nostdin','-v','error','-i',videoFile,'-i',audioFile,'-map','0:v:0','-map','1:a:0','-c','copy',completeFile],{windowsHide:true});
+  const complete = await readFile(completeFile);
+  const clipMetadata = () => ({aweme_detail:{aweme_id:'7433333333333333333',video:{play_addr:{url_list:[videoUrl]},bit_rate_audio:[{audio_meta:{file_id:'fixture-audio',media_type:'audio',codec_type:'aac',format:'mp4',bitrate:32000,url_list:{main_url:audioUrl}}}]}},
+    recommendations:[{aweme_id:'ambiguous123',video:{play_addr:{url_list:[ambiguousUrl]},bit_rate_audio:ambiguousAudio.map((url,index)=>({audio_meta:{file_id:'ambiguous-'+index,media_type:'audio',codec_type:'aac',format:'mp4',bitrate:32000,url_list:{main_url:url}}}))}}]});
   const pageLoopback = await serve((req,res) => {
+    if (req.url.startsWith('/aweme/v1/web/aweme/detail/')) { res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify(clipMetadata()));return; }
     res.writeHead(200, {'Content-Type':'text/html','Referrer-Policy':'origin',
-      'Set-Cookie':'fixture_session=active; Path=/; SameSite=Lax; HttpOnly'});
-    res.end('<!doctype html><title>Merge fixture</title><video muted></video>');
+      'Set-Cookie':'fixture_session=active; '+(pageMetadata?'Domain=fixture.iesdouyin.com; ':'')+'Path=/; SameSite=Lax; HttpOnly'});
+    const endpoint = '/aweme/v1/web/aweme/detail/?aweme_id=7433333333333333333';
+    const observerScript = process.argv.includes('--observer-xhr') ? `const request=new XMLHttpRequest();request.open('GET',${JSON.stringify(endpoint)});request.onload=()=>{window.fixtureMetadataLoaded=true};request.send();`
+      : `fetch(${JSON.stringify(endpoint)}).then(r=>r.json()).then(()=>{window.fixtureMetadataLoaded=true})`;
+    const metadata = pageJson ? '<script id="RENDER_DATA" type="application/json">'+encodeURIComponent(JSON.stringify(clipMetadata()))+'</script>'
+      : pageObserver ? '<script>'+observerScript+'</script>' : '';
+    res.end('<!doctype html><title>Merge fixture</title><video muted></video>'+metadata);
   });
-  const pageOrigin = pageLoopback.replace('127.0.0.1','v26.douyinvod.com');
+  const pageHost = pageMetadata ? 'fixture.iesdouyin.com' : 'v26.douyinvod.com';
+  const pageOrigin = pageLoopback.replace('127.0.0.1',pageHost);
   const cdnLoopback = await serve((req,res) => {
     const valid = req.headers.origin === pageOrigin && req.headers.referer === pageOrigin+'/' &&
       (req.headers.cookie || '').includes('fixture_session=active');
@@ -92,17 +108,21 @@ try {
     res.setHeader('Cache-Control','no-store');
     if (!valid) {res.writeHead(412);return res.end();}
     // The audio response deliberately lies about its MIME, as real split-track CDNs do.
-    const body = new URL(req.url,cdn).searchParams.get('mime_type') === 'audio_mp4' ? audio : video;
+    const body = req.url.startsWith('/complete.mp4') ? complete : new URL(req.url,cdn).searchParams.get('mime_type') === 'audio_mp4' ? audio : video;
     res.writeHead(200,{'Content-Type':'video/mp4','Content-Length':body.length});res.end(body);
   });
-  const cdn = cdnLoopback.replace('127.0.0.1','v26.douyinvod.com');
-  const videoUrl = cdn+'/video.mp4?vid=fixture123&mime_type=video_mp4';
-  const audioUrl = cdn+'/audio.mp4?vid=fixture123&mime_type=audio_mp4';
+  const cdn = cdnLoopback.replace('127.0.0.1',pageMetadata ? 'cdn.fixture.iesdouyin.com' : 'v26.douyinvod.com');
+  const videoUrl = cdn+'/video.mp4?'+(pageMetadata ? '' : 'vid=fixture123&')+'mime_type=video_mp4';
+  const audioUrl = cdn+'/audio.mp4?'+(pageMetadata ? '' : 'vid=fixture123&')+'mime_type=audio_mp4';
   const unrelatedUrl = cdn+'/unrelated.mp4?vid=other456&mime_type=audio_mp4';
+  const completeUrl = cdn+'/complete.mp4?vid=complete123&mime_type=video_mp4';
+  const unpairedUrl = cdn+'/unpaired.mp4?vid=missing123&mime_type=video_mp4';
+  const ambiguousUrl = cdn+'/ambiguous.mp4?vid=ambiguous123&mime_type=video_mp4';
+  const ambiguousAudio = [1,2].map(n => cdn+`/ambiguous-${n}.mp4?vid=ambiguous123&mime_type=audio_mp4`);
   assert.equal((await fetch(audioUrl.replace(cdn,cdnLoopback))).status,412);
   browser = spawn(executable,['--headless=new','--no-first-run','--no-default-browser-check','--disable-sync',
     '--disable-background-networking','--disable-component-update','--remote-debugging-pipe',
-    '--enable-unsafe-extension-debugging','--no-proxy-server','--host-resolver-rules=MAP v26.douyinvod.com 127.0.0.1','--user-data-dir='+profile,'about:blank'],
+    '--enable-unsafe-extension-debugging','--no-proxy-server','--host-resolver-rules=MAP v26.douyinvod.com 127.0.0.1,MAP fixture.iesdouyin.com 127.0.0.1,MAP cdn.fixture.iesdouyin.com 127.0.0.1','--user-data-dir='+profile,'about:blank'],
     {windowsHide:true,stdio:['ignore','ignore','ignore','pipe','pipe']});
   exit=once(browser,'exit');call=connect(browser);
   const version=await call('Browser.getVersion');
@@ -120,9 +140,11 @@ try {
   const workerSession=await attach(worker.targetId);
   await until(()=>evaluate(workerSession,'chrome.webRequest.onHeadersReceived.hasListeners()'),'capture listeners');
   const player=await create(pageOrigin+'/watch');
-  await until(()=>evaluate(player,"!!document.querySelector('video')"),'fixture page');
+  try { await until(()=>evaluate(player,"!!document.querySelector('video')"),'fixture page'); }
+  catch (error) { throw new Error(error.message + ': ' + JSON.stringify(await evaluate(player,"({url:location.href,title:document.title,text:document.body?.innerText.slice(0,400)})"))); }
+  if (pageObserver) await until(()=>evaluate(player,'window.fixtureMetadataLoaded===true'),'dynamic metadata response');
   phase='capture';
-  await evaluate(player,`Promise.all(${JSON.stringify([videoUrl,audioUrl,unrelatedUrl])}.map(url=>fetch(url,{credentials:'include'}).then(r=>r.arrayBuffer())))`);
+  await evaluate(player,`Promise.all(${JSON.stringify([videoUrl,audioUrl,unrelatedUrl,completeUrl,unpairedUrl,ambiguousUrl,...ambiguousAudio])}.map(url=>fetch(url,{credentials:'include'}).then(r=>r.arrayBuffer())))`);
   const popup=await create(extensionOrigin+'/popup.html');
   await until(()=>evaluate(popup,"!!globalThis.chrome?.tabs && !!document.querySelector('#refresh') && !document.querySelector('#refresh').disabled"),'popup loaded');
   const tabId=await evaluate(popup,`chrome.tabs.query({url:${JSON.stringify(pageOrigin+'/watch')}}).then(t=>t[0].id)`);
@@ -131,16 +153,16 @@ try {
   const videoId=stored.find(i=>i.url===videoUrl)?.id, audioId=stored.find(i=>i.url===audioUrl)?.id;
   assert.ok(videoId && audioId,'split tracks captured');
   await evaluate(popup,`chrome.tabs.update(${tabId},{active:true}).then(()=>document.querySelector('#refresh').click())`);
-  await until(()=>evaluate(popup,`[...document.querySelectorAll('button')].some(b=>!b.hidden&&/合并下载|合并音视频/.test(b.textContent))`),'merge action');
-  const clicked=await evaluate(popup,`(()=>{const row=[...document.querySelectorAll('.media-row')].find(r=>r.dataset.item===${JSON.stringify(videoId)});const b=[...row.querySelectorAll('button')].find(b=>!b.hidden&&/合并下载|合并音视频/.test(b.textContent));b?.click();return !!b})()`);
+  await until(()=>evaluate(popup,`!![...document.querySelectorAll('.media-row')].find(r=>r.dataset.item===${JSON.stringify(videoId)})?.querySelector('.action')`),'video action');
+  const clicked=await evaluate(popup,`(()=>{const row=[...document.querySelectorAll('.media-row')].find(r=>r.dataset.item===${JSON.stringify(videoId)});const b=row?.querySelector('.action');b?.click();return !!b})()`);
   assert.ok(clicked,'video row has merge action');
   const target=await until(async()=>(await targets()).find(t=>t.url.startsWith(extensionOrigin+'/merge.html#')),'merge page');
   const session=await attach(target.targetId);
   await until(()=>evaluate(session,"document.querySelector('#start')?.disabled===false"),'merge readiness');
-  const selected=await evaluate(session,`({video:document.querySelector('#video-track').value,audio:document.querySelector('#audio-track').value, audioOptions:[...document.querySelector('#audio-track').options].map(o=>o.value)})`);
-  assert.equal(selected.video,videoId);assert.equal(selected.audio,audioId,'matching vid auto-selects audio despite video/mp4 MIME');
+  assert.equal(new URLSearchParams(new URL(target.url).hash.slice(1)).get('mode'),'auto');
+  assert.equal(await evaluate(session,"document.querySelector('#tracks').hidden"),true,'normal download never asks user to choose tracks');
   const unrelatedId=stored.find(i=>i.url===unrelatedUrl)?.id;
-  assert.notEqual(selected.audio,unrelatedId,'unrelated vid is not automatically selected');
+  assert.notEqual(audioId,unrelatedId);
   phase='merge';
   assert.equal(await evaluate(popup,`fetch(${JSON.stringify(audioUrl)},{credentials:'include',referrerPolicy:'no-referrer'}).then(r=>r.status)`),412,
     'unrelated extension tab cannot reuse source context');
@@ -185,10 +207,47 @@ try {
   phase='picker-cancel';
   await until(()=>evaluate(session,"!document.querySelector('#start').disabled"),'start reset');
   await evaluate(session,`window.showSaveFilePicker=async()=>{throw new DOMException('Fixture canceled','AbortError')};document.querySelector('#start').click()`);
-  await until(()=>evaluate(session,"document.querySelector('#status').textContent==='已取消合并下载。'"),'picker cancellation');
+  await until(()=>evaluate(session,"document.querySelector('#status').textContent==='已取消下载。'"),'picker cancellation');
   assert.ok(!requests.some(r=>r.phase==='picker-cancel'),'canceling picker never downloads tracks');
   await call('Target.closeTarget',{targetId:target.targetId});
   await until(()=>evaluate(popup,'chrome.declarativeNetRequest.getSessionRules().then(r=>r.length===0)'),'merge rule cleanup');
+  for (const [name,url] of [['complete',completeUrl],['missing',unpairedUrl],['ambiguous',ambiguousUrl]]) {
+    phase=name;
+    const anchorId=stored.find(item=>item.url===url)?.id;assert.ok(anchorId);
+    const auto=await create(extensionOrigin+'/merge.html#'+new URLSearchParams({tab:String(tabId),item:anchorId,mode:'auto'}));
+    await until(()=>evaluate(auto,"document.querySelector('#start')?.disabled===false"),name+' readiness');
+    await evaluate(auto,`window.showSaveFilePicker=async({suggestedName})=>{const dir=await navigator.storage.getDirectory();return window.fixtureHandle=await dir.getFileHandle(suggestedName,{create:true})};document.querySelector('#start').click()`);
+    if(name==='complete') {
+      await until(()=>evaluate(auto,"document.querySelector('#status').textContent.startsWith('已保存')"),'complete video save');
+      const preserved=Buffer.from(await evaluate(auto,'fixtureHandle.getFile().then(f=>f.arrayBuffer()).then(b=>Array.from(new Uint8Array(b)))'));
+      assert.deepEqual(preserved,complete,'existing audio/video file saved byte-for-byte');
+      assert.ok(!requests.some(r=>r.phase===name && /audio_mp4/.test(r.url)),'complete video does not fetch any additional audio');
+    } else {
+      await until(()=>evaluate(auto,"document.querySelector('#status.error')?.textContent.includes('重新扫描')"),name+' safe failure');
+      assert.ok(!requests.some(r=>r.phase===name && /audio_mp4/.test(r.url)),name+' never guesses an audio candidate');
+      assert.equal(await evaluate(auto,'fixtureHandle.getFile().then(f=>f.size)'),0,'failure never commits incomplete video');
+    }
+    await until(()=>evaluate(auto,"!document.querySelector('#start').disabled"),name+' cleanup finished');
+    assert.equal(await evaluate(auto,"navigator.storage.getDirectory().then(async dir=>{let count=0;for await(const name of dir.keys())if(name.startsWith('shiliu-merge-'))count++;return count})"),0,'temporary downloads cleaned');
+    const autoTarget=await evaluate(auto,'chrome.tabs.getCurrent().then(t=>t.id)');
+    await evaluate(popup,`chrome.tabs.remove(${autoTarget})`);
+    await until(()=>evaluate(popup,'chrome.declarativeNetRequest.getSessionRules().then(r=>r.length===0)'),name+' rule cleanup');
+  }
+  phase='auto-write-cancel';
+  const cancelSession=await create(extensionOrigin+'/merge.html#'+new URLSearchParams({tab:String(tabId),item:videoId,mode:'auto'}));
+  await until(()=>evaluate(cancelSession,"document.querySelector('#start')?.disabled===false"),'cancel readiness');
+  await evaluate(cancelSession,`window.showSaveFilePicker=async()=>{
+    const dir=await navigator.storage.getDirectory(),handle=await dir.getFileHandle('cancel-existing.mp4',{create:true});
+    const seed=await handle.createWritable();await seed.write('previous file');await seed.close();window.fixtureHandle=handle;
+    return {name:handle.name,async createWritable(options){const native=await handle.createWritable(options);return new WritableStream({
+      async write(chunk){await native.write(chunk);document.querySelector('#cancel').click()},
+      close(){return native.close()},abort(){return native.abort()}})}}};document.querySelector('#start').click()`);
+  await until(()=>evaluate(cancelSession,"document.querySelector('#status').textContent==='已取消下载。'"),'cancel during final native write');
+  await until(()=>evaluate(cancelSession,"!document.querySelector('#start').disabled"),'cancel cleanup finished');
+  assert.equal(await evaluate(cancelSession,'fixtureHandle.getFile().then(f=>f.text())'),'previous file','cancel during commit rolls back previous file');
+  assert.equal(await evaluate(cancelSession,"navigator.storage.getDirectory().then(async dir=>{let count=0;for await(const name of dir.keys())if(name.startsWith('shiliu-merge-'))count++;return count})"),0,'cancel cleans temporary tracks');
+  const cancelTab=await evaluate(cancelSession,'chrome.tabs.getCurrent().then(t=>t.id)');await evaluate(popup,`chrome.tabs.remove(${cancelTab})`);
+  await until(()=>evaluate(popup,'chrome.declarativeNetRequest.getSessionRules().then(r=>r.length===0)'),'cancel rule cleanup');
   console.log(version.product,'→ split-track pairing, isolated context, H264 + AAC merged MP4 decode/play/seek passed;',bytes.length,'bytes');
 } finally {
   if(call && browser.exitCode===null)await call('Browser.close').catch(()=>browser.kill());
